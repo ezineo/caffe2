@@ -13,6 +13,14 @@ if not exist %CAFFE2_ROOT%\build_host_protoc\bin\protoc.exe call %CAFFE2_ROOT%\s
 if not exist %CAFFE2_ROOT%\build mkdir %CAFFE2_ROOT%\build
 cd %CAFFE2_ROOT%\build
 
+if NOT DEFINED USE_CUDA (
+  set USE_CUDA=OFF
+)
+
+if NOT DEFINED CMAKE_BUILD_TYPE (
+  set CMAKE_BUILD_TYPE=Release
+)
+
 :: Set up cmake. We will skip building the test files right now.
 :: TODO: enable cuda support.
 cmake .. ^
@@ -20,11 +28,12 @@ cmake .. ^
   -DCMAKE_VERBOSE_MAKEFILE=1 ^
   -DBUILD_TEST=OFF ^
   -DBUILD_SHARED_LIBS=OFF ^
-  -DUSE_CUDA=OFF ^
+  -DUSE_CUDA=%USE_CUDA% ^
+  -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% ^
   -DPROTOBUF_PROTOC_EXECUTABLE=%CAFFE2_ROOT%\build_host_protoc\bin\protoc.exe ^
   || exit /b
 
 :: Actually run the build
-msbuild ALL_BUILD.vcxproj || exit /b
+cmake --build . --config %CMAKE_BUILD_TYPE% || exit /b
 
 cd %ORIGINAL_DIR%
