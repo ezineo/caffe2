@@ -15,8 +15,11 @@ extern "C" {
 
 #include "caffe2/core/common.h"
 #include "caffe2/core/types.h"
+
+#ifndef __CUDACC__
 #include "Eigen/Core"
 #include "Eigen/Dense"
+#endif
 
 namespace caffe2 {
 
@@ -24,6 +27,7 @@ namespace caffe2 {
 // engine specified.
 class DefaultEngine {};
 
+#ifndef __CUDACC__
 // Common Eigen types that we will often use
 template <typename T>
 using EigenMatrixMap =
@@ -47,6 +51,7 @@ using ConstEigenVectorMap =
 template <typename T>
 using ConstEigenVectorArrayMap =
     Eigen::Map<const Eigen::Array<T, Eigen::Dynamic, 1> >;
+#endif
 
 namespace math {
 
