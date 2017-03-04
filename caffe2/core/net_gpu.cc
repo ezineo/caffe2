@@ -371,7 +371,9 @@ class SingleThreadAsyncNet : public SimpleNet {
   }
 
   bool RunAsync() {
-    LOG(FATAL) << "RunAsync() not implemented for singlethread_async net";
+    CAFFE_THROW("RunAsync() not implemented for singlethread_async net");
+	// Just to suppress compiler warning.
+	return false;
   }
 
  private:

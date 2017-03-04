@@ -4,7 +4,7 @@
 
 :: This script shows how one can build a Caffe2 binary for windows.
 
-@echo off
+@echo on
 
 SET ORIGINAL_DIR=%cd%
 SET CAFFE2_ROOT=%~dp0%..
@@ -29,7 +29,6 @@ cmake .. ^
   -DBUILD_TEST=OFF ^
   -DBUILD_SHARED_LIBS=OFF ^
   -DUSE_CUDA=%USE_CUDA% ^
-  -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% ^
   -DPROTOBUF_PROTOC_EXECUTABLE=%CAFFE2_ROOT%\build_host_protoc\bin\protoc.exe ^
   || exit /b
 
