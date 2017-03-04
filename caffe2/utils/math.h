@@ -205,14 +205,14 @@ void Select(const int N, const int D, const T* x, const int* idx, T* y,
 // For small FixedValues (like FixedSize=1) the function might provide more
 // efficent implementation hard-coded statically for this size.
 template <typename T, class Context, int FixedSize = -1>
-void Scale(const int N, const T alpha, const T* x, T* y,
+inline void Scale(const int N, const T alpha, const T* x, T* y,
            Context* context);
 
 // Different from the Scale function above, if alpha is passed in
 // as a pointer, we will assume that it lives on the Context device,
 // for example on GPU.
 template <typename T, class Context>
-inline void Scale(const int N, const T* alpha, const T* x, T* y,
+void Scale(const int N, const T* alpha, const T* x, T* y,
            Context* context);
 
 // For small FixedValues (like FixedSize=1) the function might provide more
