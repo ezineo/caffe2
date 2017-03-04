@@ -55,5 +55,5 @@ endif()
 # ---[ If we are using msvc, set no warning flags
 if (MSVC)
   add_definitions(/MP)
-  add_definitions(/wd4244 /wd4506 /wd4065 /wd4018 /wd4267 /wd4800 /wd5030)
+  add_definitions(/wd4244 /wd4506 /wd4065 /wd4018 /wd4267 /wd4800 /wd5030 /wd4996 /wd4305)
 endif()
