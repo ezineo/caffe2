@@ -14,7 +14,7 @@ if not exist %CAFFE2_ROOT%\build mkdir %CAFFE2_ROOT%\build
 cd %CAFFE2_ROOT%\build
 
 if NOT DEFINED USE_CUDA (
-  set USE_CUDA=OFF
+  set USE_CUDA=ON
 )
 
 if NOT DEFINED CMAKE_BUILD_TYPE (

@@ -2,21 +2,21 @@ version: '{build}'
 clone_folder: c:\projects\caffe2
 environment:
   matrix:
-    - USE_CUDA: OFF
-      CMAKE_BUILD_TYPE: Release
+#    - USE_CUDA: OFF
+#      CMAKE_BUILD_TYPE: Release
 
     - USE_CUDA: ON
       CMAKE_BUILD_TYPE: Release
 
-    - USE_CUDA: OFF
-      CMAKE_BUILD_TYPE: Debug
+#    - USE_CUDA: OFF
+#      CMAKE_BUILD_TYPE: Debug
 
-    - USE_CUDA: ON
-      CMAKE_BUILD_TYPE: Debug
+#    - USE_CUDA: ON
+#      CMAKE_BUILD_TYPE: Debug
 
-matrix:
-  allow_failures:
-    - USE_CUDA: ON
+#matrix:
+#  allow_failures:
+#    - USE_CUDA: ON
 
 install:
 - cmd: c:\projects\caffe2\scripts\appveyor\install.bat
