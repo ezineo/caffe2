@@ -73,13 +73,13 @@ struct AxpyImpl<T, CPUContext, 1> {
 }  // namespace detail
 
 template <typename T, class Context, int FixedSize>
-void Scale(const int N, const T alpha, const T* x, T* y,
+inline void Scale(const int N, const T alpha, const T* x, T* y,
            Context* context) {
   detail::ScaleImpl<T, Context, FixedSize>()(N, alpha, x, y, context);
 }
 
 template <typename T, class Context, int FixedSize>
-void Axpy(const int N, const T alpha, const T* x, T* y,
+inline void Axpy(const int N, const T alpha, const T* x, T* y,
            Context* context) {
   detail::AxpyImpl<T, Context, FixedSize>()(N, alpha, x, y, context);
 }
