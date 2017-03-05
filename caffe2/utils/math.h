@@ -202,10 +202,8 @@ template <typename T, class Context>
 void Select(const int N, const int D, const T* x, const int* idx, T* y,
             Context* context);
 
-// For small FixedValues (like FixedSize=1) the function might provide more
-// efficent implementation hard-coded statically for this size.
-template <typename T, class Context, int FixedSize = -1>
-inline void Scale(const int N, const T alpha, const T* x, T* y,
+template <typename T, class Context>
+void Scale(const int N, const T alpha, const T* x, T* y,
            Context* context);
 
 // Different from the Scale function above, if alpha is passed in
@@ -215,11 +213,9 @@ template <typename T, class Context>
 void Scale(const int N, const T* alpha, const T* x, T* y,
            Context* context);
 
-// For small FixedValues (like FixedSize=1) the function might provide more
-// efficent implementation hard-coded statically for this size.
-template <typename T, class Context, int FixedSize = -1>
-inline void Axpy(const int N, const T alpha, const T* x, T* y,
-                 Context* context);
+template <typename T, class Context>
+void Axpy(const int N, const T alpha, const T* x, T* y,
+          Context* context);
 
 // Different from the Axpy function above, if alpha is passed in
 // as a pointer, we will assume that it lives on the Context device,
