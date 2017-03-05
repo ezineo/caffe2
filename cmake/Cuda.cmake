@@ -185,6 +185,7 @@ else()
   # warning for now.
   list(APPEND CUDA_NVCC_FLAGS "-Wno-deprecated-gpu-targets")
 endif()
+
 include_directories(SYSTEM ${CUDA_INCLUDE_DIRS})
 list(APPEND Caffe2_DEPENDENCY_LIBS ${CUDA_CUDART_LIBRARY}
                               ${CUDA_curand_LIBRARY} ${CUDA_CUBLAS_LIBRARIES})
@@ -231,6 +232,27 @@ if (NOT MSVC)
   list(APPEND CUDA_NVCC_FLAGS "-std=c++11")
   list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -fPIC")
 endif()
+
+# Debug and Release symbol support
+if (MSVC)
+  if (${CMAKE_BUILD_TYPE} MATCHES "Release")
+	if (${BUILD_SHARED_LIBS})
+	  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -MD")
+	else()
+	  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -MT")
+	endif()
+  elseif(${CMAKE_BUILD_TYPE} MATCHES "Debug")
+	if (${BUILD_SHARED_LIBS})
+	  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -MDd")
+	else()
+	  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -MTd")
+	endif()
+  else()
+    message(FATAL_ERROR "Unknown cmake build type: " ${CMAKE_BUILD_TYPE})
+  endif()
+endif()
+
+
 if(OpenMP_FOUND)
   list(APPEND CUDA_NVCC_FLAGS "-Xcompiler ${OpenMP_CXX_FLAGS}")
 endif()
