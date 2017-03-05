@@ -242,6 +242,10 @@ if (MSVC)
 	  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -MT")
 	endif()
   elseif(${CMAKE_BUILD_TYPE} MATCHES "Debug")
+    message(FATAL_ERROR
+	        "Caffe2 currently does not support the combination of MSVC, Cuda "
+			"and Debug mode. Either set USE_CUDA=OFF or set the build type "
+			"to Release")
 	if (${BUILD_SHARED_LIBS})
 	  list(APPEND CUDA_NVCC_FLAGS "-Xcompiler -MDd")
 	else()
