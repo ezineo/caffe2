@@ -203,6 +203,16 @@ void Select(const int N, const int D, const T* x, const int* idx, T* y,
             Context* context);
 
 template <typename T, class Context>
+void AddScalar(const int N, const T alpha, const T* x, T* y, Context* context);
+
+// Different from the AddScalar function above, if alpha is passed in
+// as a pointer, we will assume that it lives on the Context device,
+// for example on GPU.
+template <typename T, class Context>
+void AddScalar(const int N, const T* alpha, const T* x, T* y,
+           Context* context);
+    
+template <typename T, class Context>
 void Scale(const int N, const T alpha, const T* x, T* y, Context* context);
 
 // Different from the Scale function above, if alpha is passed in
