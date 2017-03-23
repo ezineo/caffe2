@@ -3,7 +3,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from caffe2.python import schema
+from caffe2.python import schema, scope
 from caffe2.python.layers.tags import TagContext
 
 from collections import namedtuple
@@ -34,8 +34,8 @@ def layer_exists(name):
     return name in _LAYER_REGISTRY
 
 
-def create_layer(name, *args, **kwargs):
-    return _LAYER_REGISTRY[name](*args, **kwargs)
+def create_layer(layer_name, *args, **kwargs):
+    return _LAYER_REGISTRY[layer_name](*args, **kwargs)
 
 
 # TODO(amalevich): Modify this to some better struct, something closer to
@@ -48,8 +48,8 @@ def _is_request_only_scalar(scalar):
     if len(scalar.field_metadata()) == 0:
         return False
     for metadata in scalar.field_metadata():
-        if not (metadata and metadata.feature_specs and
-                metadata.feature_specs.feature_is_request_only):
+        if not (metadata and metadata.feature_specs and getattr(
+                metadata.feature_specs, 'feature_is_request_only', False)):
             return False
     return True
 
@@ -73,6 +73,9 @@ class ModelLayer(object):
         self.tags.update(TagContext.current().tags)
         self.params = []
 
+    def get_type(self):
+        return self.__class__.__name__
+
     def get_output_schema(self):
         assert self.output_schema is not None, "Schema is not initialized"
         return self.output_schema
@@ -80,24 +83,32 @@ class ModelLayer(object):
     def get_parameters(self):
         return self.params
 
+    def get_fp16_compatible_parameters(self):
+        """Return a subset of parameters which can be converted to fp16"""
+        return []
+
     def get_memory_usage(self):
         return 0
 
     def add_operators(self, net, init_net=None,
                       context=InstantiationContext.TRAINING):
-        if context != InstantiationContext.PREDICTION:
-            assert init_net,\
-                "Only prediction context can be used without init_net"
-        if init_net:
-            for param in self.params:
-                # TODO(amalevich): Either return back to lambdas, that add all
-                # params (looks a bit safer and breaking less abstractions) or
-                # extend Net interface to this type of operations better
-                init_net._net.op.extend([param.initializer])
-        if context == InstantiationContext.TRAINING:
-            self.add_train_ops(net)
-        else:
-            self.add_ops(net)
+        # Namescope below should warranty that all intermediate blobs will be
+        # assiciated with the layer that produces them
+        with scope.NameScope(self.name):
+            if context != InstantiationContext.PREDICTION:
+                assert init_net,\
+                    "Only prediction context can be used without init_net"
+            if init_net:
+                for param in self.params:
+                    # TODO(amalevich): Either return back to lambdas, that add
+                    # all params (looks a bit safer and breaking less
+                    # abstractions) or extend Net interface to this type of
+                    # operations better
+                    init_net._net.op.extend([param.initializer])
+            if context == InstantiationContext.TRAINING:
+                self.add_train_ops(net)
+            else:
+                self.add_ops(net)
 
     def add_ops(self, net):
         raise NotImplementedError

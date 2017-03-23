@@ -8,6 +8,7 @@
 #include "caffe2/core/operator.h"
 #include "caffe2/core/predictor.h"
 #include "caffe2/utils/mkl_utils.h"
+#include "caffe2/utils/string_utils.h"
 #include "google/protobuf/io/coded_stream.h"
 #include "google/protobuf/io/zero_copy_stream_impl_lite.h"
 
@@ -135,6 +136,22 @@ const Func& getOpFunc(const std::string& token) {
 
 const Func& getGradientFunc(const std::string& token) {
   return getOpFunc(token + "_gradient");
+}
+
+py::object fetchBlob(Workspace* ws, const std::string& name) {
+  CAFFE_ENFORCE(ws->HasBlob(name), "Can't find blob: ", name);
+  const caffe2::Blob& blob = *(ws->GetBlob(name));
+  auto fetcher = CreateFetcher(blob.meta().id());
+  if (fetcher) {
+    return fetcher->Fetch(blob);
+  } else {
+    // If there is no fetcher registered, return a metainfo string.
+    // If all branches failed, we will return a metainfo string.
+    std::stringstream ss;
+    ss << caffe2::string(name) << ", a C++ native class of type "
+       << blob.TypeName() << ".";
+    return py::str(ss.str());
+  }
 }
 }
 
@@ -399,6 +416,12 @@ void addObjectMethods(py::module& m) {
             auto* blob = self->CreateBlob(name);
             return py::cast(blob, py::return_value_policy::reference_internal);
           })
+      .def("fetch_blob", &python_detail::fetchBlob)
+      .def(
+          "has_blob",
+          [](Workspace* self, const std::string& name) {
+            return self->HasBlob(name);
+          })
       .def(
           "_run_net",
           [](Workspace* self, py::bytes def) {
@@ -477,6 +500,10 @@ void addObjectMethods(py::module& m) {
       .def("new_cursor", &db::DB::NewCursor)
       .def("close", &db::DB::Close);
   m.def("create_db", &db::CreateDB);
+  m.def("registered_dbs", []() {
+    return caffe2::db::Caffe2DBRegistry()->Keys();
+  });
+
 
   // OpSchema
   py::class_<OpSchema>(m, "OpSchema")
@@ -509,11 +536,38 @@ void addObjectMethods(py::module& m) {
       .def(
           "__init__",
           [](Predictor& instance, py::bytes init_net, py::bytes predict_net) {
+            CAFFE_ENFORCE(gWorkspace);
             NetDef init_net_, predict_net_;
             CAFFE_ENFORCE(ParseProtobufFromLargeString(init_net, &init_net_));
             CAFFE_ENFORCE(
                 ParseProtobufFromLargeString(predict_net, &predict_net_));
-            new (&instance) Predictor(init_net_, predict_net_);
+            new (&instance) Predictor(init_net_, predict_net_, gWorkspace);
+          })
+      .def(
+          "run",
+          [](Predictor& instance,
+             std::vector<py::object> inputs) -> std::vector<py::object> {
+            std::vector<TensorCPU*> tensors;
+            std::vector<TensorCPU> tensors_data(inputs.size());
+            for (auto i = 0; i < inputs.size(); ++i) {
+              auto input = inputs[i];
+              CAFFE_ENFORCE(
+                  PyArray_Check(input.ptr()),
+                  "Input must be of type numpy array.");
+              PyArrayObject* array =
+                  reinterpret_cast<PyArrayObject*>(input.ptr());
+              TensorFeeder<CPUContext>().FeedTensor(
+                  DeviceOption(), array, &(tensors_data[i]));
+              tensors.push_back(&(tensors_data[i]));
+            }
+            std::vector<TensorCPU*> out;
+            instance.run(tensors, &out);
+            std::vector<py::object> pyout;
+            for (auto t : out) {
+              pyout.push_back(
+                  TensorFetcher<CPUContext>().FetchTensor(*t, true).obj);
+            }
+            return pyout;
           });
 }
 
@@ -609,6 +663,16 @@ void addGlobalMethods(py::module& m) {
       names.push_back(kv.first);
     }
     return names;
+  });
+  m.def("nearby_opnames", [](const std::string& name) {
+    std::vector<std::string> alternatives;
+    int editTolerance = 3;
+    for (auto it : caffe2::CPUOperatorRegistry()->Keys()) {
+      if(editDistance(it, name, editTolerance) < editTolerance + 1) {
+        alternatives.push_back(it);
+      }
+    }
+    return alternatives;
   });
   m.def("local_blobs", []() {
     CAFFE_ENFORCE(gWorkspace);
@@ -732,19 +796,7 @@ void addGlobalMethods(py::module& m) {
     return true;
   });
   m.def("fetch_blob", [](const std::string& name) -> py::object {
-    CAFFE_ENFORCE(gWorkspace->HasBlob(name), "Can't find blob: ", name);
-    const caffe2::Blob& blob = *(gWorkspace->GetBlob(name));
-    auto fetcher = CreateFetcher(blob.meta().id());
-    if (fetcher) {
-      return fetcher->Fetch(blob);
-    } else {
-      // If there is no fetcher registered, return a metainfo string.
-      // If all branches failed, we will return a metainfo string.
-      std::stringstream ss;
-      ss << caffe2::string(name) << ", a C++ native class of type "
-         << blob.TypeName() << ".";
-      return py::str(ss.str());
-    }
+    return python_detail::fetchBlob(gWorkspace, name);
   });
   m.def(
       "feed_blob",

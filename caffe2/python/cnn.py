@@ -76,22 +76,39 @@ class CNNModelHelper(ModelHelperBase):
                 blob_in, blob_out, **kwargs)
         return data, label
 
-    def Conv(
-        self, blob_in, blob_out, dim_in, dim_out, kernel, weight_init=None,
-        bias_init=None, group=1, **kwargs
+    def _ConvBase(  # noqa
+        self, is_nd, blob_in, blob_out, dim_in, dim_out, kernel,
+        weight_init=None, bias_init=None, group=1, transform_inputs=None,
+        **kwargs
     ):
-        """Convolution. We intentionally do not provide odd kernel/stride/pad
-        settings in order to discourage the use of odd cases.
-        """
-        use_bias = False if ("no_bias" in kwargs and kwargs["no_bias"]) else True
+        kernels = []
+        if is_nd:
+            if not isinstance(kernel, list):
+                kernels = [kernel]
+            else:
+                kernels = kernel
+        else:
+            kernels = [kernel] * 2
+
+        if self.use_cudnn:
+            kwargs['engine'] = 'CUDNN'
+            kwargs['exhaustive_search'] = self.cudnn_exhaustive_search
+            if self.ws_nbytes_limit:
+                kwargs['ws_nbytes_limit'] = self.ws_nbytes_limit
+
+        use_bias =\
+            False if ("no_bias" in kwargs and kwargs["no_bias"]) else True
         weight_init = weight_init if weight_init else ('XavierFill', {})
         bias_init = bias_init if bias_init else ('ConstantFill', {})
         blob_out = blob_out or self.net.NextName()
-        weight_shape = (
-            [dim_out, int(dim_in / group), kernel, kernel]
-            if self.order == "NCHW" else
-            [dim_out, kernel, kernel, int(dim_in / group)]
-        )
+        weight_shape = [dim_out]
+        if self.order == "NCHW":
+            weight_shape.append(int(dim_in / group))
+            weight_shape.extend(kernels)
+        else:
+            weight_shape.extend(kernels)
+            weight_shape.append(int(dim_in / group))
+
         if self.init_params:
             weight = self.param_init_net.__getattr__(weight_init[0])(
                 [],
@@ -122,17 +139,13 @@ class CNNModelHelper(ModelHelperBase):
         if use_bias:
             self.biases.append(bias)
 
-        if self.use_cudnn:
-            kwargs['engine'] = 'CUDNN'
-            kwargs['exhaustive_search'] = self.cudnn_exhaustive_search
-            if self.ws_nbytes_limit:
-                kwargs['ws_nbytes_limit'] = self.ws_nbytes_limit
-
-        inputs = []
         if use_bias:
             inputs = [blob_in, weight, bias]
         else:
             inputs = [blob_in, weight]
+
+        if transform_inputs is not None:
+            transform_inputs(self, blob_out, inputs)
 
         # For the operator, we no longer need to provide the no_bias field
         # because it can automatically figure this out from the number of
@@ -144,10 +157,27 @@ class CNNModelHelper(ModelHelperBase):
         return self.net.Conv(
             inputs,
             blob_out,
-            kernel=kernel,
+            kernels=kernels,
             order=self.order,
-            **kwargs
-        )
+            **kwargs)
+
+    def ConvNd(self, blob_in, blob_out, dim_in, dim_out, kernel,
+               weight_init=None, bias_init=None, group=1, transform_inputs=None,
+               **kwargs):
+        """N-dimensional convolution for inputs with NCHW storage order.
+        """
+        assert self.order == "NCHW", "ConvNd only supported for NCHW storage."
+        return self._ConvBase(True, blob_in, blob_out, dim_in, dim_out, kernel,
+                              weight_init, bias_init, group, transform_inputs,
+                              **kwargs)
+
+    def Conv(self, blob_in, blob_out, dim_in, dim_out, kernel, weight_init=None,
+             bias_init=None, group=1, transform_inputs=None, **kwargs):
+        """2-dimensional convolution.
+        """
+        return self._ConvBase(False, blob_in, blob_out, dim_in, dim_out, kernel,
+                              weight_init, bias_init, group, transform_inputs,
+                              **kwargs)
 
     def ConvTranspose(
         self, blob_in, blob_out, dim_in, dim_out, kernel, weight_init=None,
@@ -317,8 +347,8 @@ class CNNModelHelper(ModelHelperBase):
         bias_init=None, **kwargs
     ):
         """FC"""
-        weight_init = weight_init if weight_init else ('XavierFill', {})
-        bias_init = bias_init if bias_init else ('ConstantFill', {})
+        weight_init = weight_init or ('XavierFill', {})
+        bias_init = bias_init or ('ConstantFill', {})
         blob_out = blob_out or self.net.NextName()
         if self.init_params:
             weight = self.param_init_net.__getattr__(weight_init[0])(
@@ -604,9 +634,20 @@ class CNNModelHelper(ModelHelperBase):
         def init_blob(value, suffix):
             return self.param_init_net.ConstantFill(
                 [], blob_out + "_" + suffix, shape=[dim_in], value=value)
-        scale, bias = init_blob(1.0, "s"), init_blob(0.0, "b")
-        running_mean = init_blob(0.0, "rm")
-        running_inv_var = init_blob(1.0, "riv")
+
+        if self.init_params:
+            scale, bias = init_blob(1.0, "s"), init_blob(0.0, "b")
+            running_mean = init_blob(0.0, "rm")
+            running_inv_var = init_blob(1.0, "riv")
+        else:
+            scale = core.ScopedBlobReference(
+                    blob_out + '_s', self.param_init_net)
+            bias = core.ScopedBlobReference(
+                    blob_out + '_b', self.param_init_net)
+            running_mean = core.ScopedBlobReference(
+                    blob_out + '_rm', self.param_init_net)
+            running_inv_var = core.ScopedBlobReference(
+                    blob_out + '_riv', self.param_init_net)
 
         self.params.extend([scale, bias])
         self.computed_params.extend([running_mean, running_inv_var])
@@ -636,20 +677,27 @@ class CNNModelHelper(ModelHelperBase):
         return self.net.Iter(blob_out, blob_out, **kwargs)
 
     def Accuracy(self, blob_in, blob_out, **kwargs):
-        dev = kwargs['device_option'] if 'device_option' in kwargs else scope.CurrentDeviceScope()
+        dev = kwargs['device_option'] if 'device_option' in kwargs \
+            else scope.CurrentDeviceScope()
+        is_cpu = dev is None or dev.device_type == caffe2_pb2.CPU
 
-        blobs_in_dev = []
-        # if device_option is CPU (or None, so assumed to be CPU), nothing needs to be done
-        if dev == None or dev.device_type == caffe2_pb2.CPU:
-            blobs_in_dev = blob_in
+        # We support top_k > 1 only on CPU
+        if not is_cpu and 'top_k' in kwargs and kwargs['top_k'] > 1:
+            pred_host = self.net.CopyGPUToCPU(blob_in[0], blob_in[0] + "_host")
+            label_host = self.net.CopyGPUToCPU(blob_in[1], blob_in[1] + "_host")
+
+            # Now use the Host version of the accuracy op
+            self.net.Accuracy([pred_host, label_host],
+                              blob_out,
+                              device_option=core.DeviceOption(caffe2_pb2.CPU, 0),
+                              **kwargs)
         else:
-            # Otherwise insert copy operators
-            pred_host = self.net.CopyGPUToCPU(blob_in[0], blob_in[0]+"_host")
-            label_host = self.net.CopyGPUToCPU(blob_in[1], blob_in[1]+"_host")
-            blobs_in_dev = [pred_host, label_host]
+            self.net.Accuracy(blob_in, blob_out)
 
-        # Now use the Host version of the accuracy op
-        self.net.Accuracy(blobs_in_dev, blob_out, device_option=core.DeviceOption(caffe2_pb2.CPU, 0), **kwargs)
+    def PadImage(
+        self, blob_in, blob_out, **kwargs
+    ):
+        self.net.PadImage(blob_in, blob_out, **kwargs)
 
     @property
     def XavierInit(self):
@@ -699,110 +747,3 @@ class CNNModelHelper(ModelHelperBase):
         device_option.device_type = caffe2_pb2.CUDA
         device_option.cuda_gpu_id = gpu_id
         return device_option
-
-    def LSTM(self, input_blob, seq_lengths, initial_states, dim_in, dim_out,
-             scope=None):
-        def s(name):
-            # We have to manually scope due to our internal/external blob
-            # relationships.
-            scope_name = scope or str(input_blob)
-            return "{}/{}".format(str(scope_name), str(name))
-
-        (hidden_input_blob, cell_input_blob) = initial_states
-
-        input_blob = self.FC(input_blob, s("i2h"),
-                             dim_in=dim_in, dim_out=4 * dim_out, axis=2)
-
-        step_net = CNNModelHelper(name="LSTM")
-        step_net.Proto().external_input.extend([
-            str(seq_lengths),
-            "input_t",
-            "timestep",
-            "hidden_t_prev",
-            "cell_t_prev",
-            s("gates_t_w"),
-            s("gates_t_b"),
-        ])
-        step_net.Proto().type = "simple"
-        step_net.Proto().external_output.extend(
-            ["hidden_t", "cell_t", s("gates_t")])
-        step_net.FC("hidden_t_prev", s("gates_t"),
-                    dim_in=dim_out, dim_out=4 * dim_out, axis=2)
-        step_net.net.Sum([s("gates_t"), "input_t"], [s("gates_t")])
-        step_net.net.LSTMUnit(
-            ["cell_t_prev", s("gates_t"), str(seq_lengths), "timestep"],
-            ["hidden_t", "cell_t"])
-
-        links = [
-            ("hidden_t_prev", s("hidden"), 0),
-            ("hidden_t", s("hidden"), 1),
-            ("cell_t_prev", s("cell"), 0),
-            ("cell_t", s("cell"), 1),
-            ("input_t", str(input_blob), 0),
-        ]
-        link_internal, link_external, link_offset = zip(*links)
-
-        # # Initialize params for step net in the parent net
-        # for op in step_net.param_init_net.Proto().op:
-
-        # Set up the backward links
-        backward_ops, backward_mapping = core.GradientRegistry.GetBackwardPass(
-            step_net.Proto().op,
-            {"hidden_t": "hidden_t_grad", "cell_t": "cell_t_grad"})
-        backward_mapping = {str(k): str(v) for k, v
-                            in backward_mapping.items()}
-        backward_step_net = core.Net("LSTMBackward")
-        del backward_step_net.Proto().op[:]
-        backward_step_net.Proto().op.extend(backward_ops)
-
-        backward_links = [
-            ("hidden_t_prev_grad", s("hidden_grad"), 0),
-            ("hidden_t_grad", s("hidden_grad"), 1),
-            ("cell_t_prev_grad", s("cell_grad"), 0),
-            ("cell_t_grad", s("cell_grad"), 1),
-            (s("gates_t_grad"), str(input_blob) + "_grad", 0),
-        ]
-
-        backward_link_internal, backward_link_external, \
-            backward_link_offset = zip(*backward_links)
-
-        backward_step_net.Proto().external_input.extend(
-            ["hidden_t_grad", "cell_t_grad"])
-        backward_step_net.Proto().external_input.extend(
-            step_net.Proto().external_input)
-        backward_step_net.Proto().external_input.extend(
-            step_net.Proto().external_output)
-
-        inputs = map(str, [input_blob, seq_lengths,
-                           s("gates_t_w"), s("gates_t_b"),
-                           hidden_input_blob, cell_input_blob])
-        recurrent_inputs = [str(hidden_input_blob), str(cell_input_blob)]
-
-        output, _, _, hidden_state, cell_state, _ = self.net.RecurrentNetwork(
-            inputs,
-            [s("output"), s("hidden"), s("cell"),
-                s("hidden_output"), s("cell_output"), s("step_workspaces")],
-            param=map(inputs.index, step_net.params),
-            alias_src=[s("hidden"), s("hidden"), s("cell")],
-            alias_dst=[s("output"), s("hidden_output"), s("cell_output")],
-            alias_offset=[1, -1, -1],
-            recurrent_states=[s("hidden"), s("cell")],
-            initial_recurrent_state_ids=map(inputs.index, recurrent_inputs),
-            link_internal=link_internal,
-            link_external=link_external,
-            link_offset=link_offset,
-            backward_link_internal=backward_link_internal,
-            backward_link_external=backward_link_external,
-            backward_link_offset=backward_link_offset,
-            step_net=str(step_net.Proto()),
-            backward_step_net=str(backward_step_net.Proto()),
-            timestep="timestep")
-        self.param_init_net.Proto().op.extend(
-            step_net.param_init_net.Proto().op)
-        self.params += step_net.params
-        for p in step_net.params:
-            if str(p) in backward_mapping:
-                self.param_to_grad[p] = backward_mapping[str(p)]
-        self.weights += step_net.weights
-        self.biases += step_net.biases
-        return output, hidden_state, cell_state

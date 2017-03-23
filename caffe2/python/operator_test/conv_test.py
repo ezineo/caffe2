@@ -153,7 +153,9 @@ class TestConvolution(hu.HypothesisTestCase):
                                    order, engine, use_bias, gc, dc):
         dkernel = dilation * (kernel - 1) + 1
 
-        assume("" == engine or 1 == dilation)
+        # cuDNN v6+ supports dilated convolutions
+        if (workspace.GetCuDNNVersion() < 6000):
+            assume("" == engine or 1 == dilation)
         assume(engine != "MKLDNN" or use_bias is True)
 
         op = core.CreateOperator(
@@ -188,6 +190,78 @@ class TestConvolution(hu.HypothesisTestCase):
         for i in range(len(inputs)):
             self.assertGradientChecks(gc, op, inputs, i, [0])
 
+    def _nd_convlution_nchw(self, n, input_channels, output_channels,
+                            batch_size, stride, size, kernel, dilation, pad,
+                            use_bias, gc, dc):
+        dkernel = dilation * (kernel - 1) + 1
+        op = core.CreateOperator(
+            "Conv",
+            ["X", "w", "b"] if use_bias else ["X", "w"],
+            ["Y"],
+            strides=[stride] * n,
+            kernels=[kernel] * n,
+            dilations=[dilation] * n,
+            pads=[pad] * n * 2,
+            order="NCHW",
+            engine="",
+        )
+
+        input_dims = [batch_size, input_channels]
+        input_dims.extend([size] * n)
+        filter_dims = [output_channels, input_channels]
+        filter_dims.extend([kernel] * n)
+
+        X = np.random.rand(*input_dims).astype(np.float32) - 0.5
+        w = np.random.rand(*filter_dims).astype(np.float32) - 0.5
+        b = np.random.rand(output_channels).astype(np.float32) - 0.5
+
+        inputs = [X, w, b] if use_bias else [X, w]
+
+        if size + pad + pad < dkernel or size + pad + pad < dkernel:
+            with self.assertRaises(RuntimeError):
+                self.assertDeviceChecks(dc, op, inputs, [0])
+            return
+
+        self.assertDeviceChecks(dc, op, inputs, [0])
+        for i in range(len(inputs)):
+            self.assertGradientChecks(gc, op, inputs, i, [0])
+
+    @given(input_channels=st.integers(1, 3),
+           output_channels=st.integers(1, 2),
+           batch_size=st.integers(1, 3),
+           stride=st.integers(1, 3),
+           size=st.integers(7, 10),
+           kernel=st.integers(1, 2),
+           dilation=st.integers(1, 3),
+           pad=st.integers(0, 3),
+           use_bias=st.booleans(),
+           **hu.gcs)
+    def test_1d_convlution_nchw(self, input_channels, output_channels,
+                                batch_size, stride, size, kernel, dilation, pad,
+                                use_bias, gc, dc):
+        self._nd_convlution_nchw(
+            1, input_channels, output_channels, batch_size, stride, size,
+            kernel, dilation, pad, use_bias, gc, dc
+        )
+
+    @given(input_channels=st.integers(1, 2),
+           output_channels=st.integers(1, 2),
+           batch_size=st.integers(1, 2),
+           stride=st.integers(1, 2),
+           size=st.integers(4, 5),
+           kernel=st.integers(1, 2),
+           dilation=st.integers(1, 2),
+           pad=st.integers(0, 2),
+           use_bias=st.booleans(),
+           **hu.gcs)
+    def test_3d_convlution_nchw(self, input_channels, output_channels,
+                                batch_size, stride, size, kernel, dilation, pad,
+                                use_bias, gc, dc):
+        self._nd_convlution_nchw(
+            3, input_channels, output_channels, batch_size, stride, size,
+            kernel, dilation, pad, use_bias, gc, dc
+        )
+
     @given(stride=st.integers(1, 3),
            pad=st.integers(0, 3),
            kernel=st.integers(1, 5),
@@ -211,8 +285,14 @@ class TestConvolution(hu.HypothesisTestCase):
         b = np.random.rand(output_channels).astype(np.float32) - 0.5
         Output = collections.namedtuple("Output", ["Y", "engine", "order"])
         outputs = []
+
+        cudnn_v6p = workspace.GetCuDNNVersion() >= 6000
+        dilated_conv = dilation == 1
+        # cuDNN v6+ supports dilated convolutions
+        engine_list = ["", "CUDNN"] if cudnn_v6p or dilated_conv else [""]
+
         for order in ["NCHW", "NHWC"]:
-            for engine in (["", "CUDNN"] if dilation == 1 else [""]):
+            for engine in engine_list:
                 op = core.CreateOperator(
                     "Conv",
                     ["X", "w", "b"] if use_bias else ["X", "w"],

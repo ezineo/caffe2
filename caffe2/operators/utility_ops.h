@@ -131,6 +131,33 @@ class AliasOp final : public Operator<Context> {
   }
 };
 
+/**
+ * @brief Pass inputs to outputs.
+ * Input:
+ *   DATA - dense tensor.
+ * Output:
+ *   DATA - same tensor as input.
+ */
+template <class Context>
+class EnsureDenseOp final : public Operator<Context> {
+ public:
+  USE_OPERATOR_CONTEXT_FUNCTIONS;
+  USE_SIMPLE_CTOR_DTOR(EnsureDenseOp)
+
+  bool RunOnDevice() override {
+    const auto& input = Input(0);
+    auto* output = Output(0);
+    CAFFE_ENFORCE_GT(input.ndim(), 0, "Input has to be at least a vector.");
+    // it is allowed to have the output inplace overwrite the input but also
+    // allow the output to be copied from the input
+    if (&input != output) {
+      output->ResizeLike(input);
+      output->CopyFrom(input, &context_);
+    }
+    return true;
+  }
+};
+
 template <class Context>
 class FlattenOp : public Operator<Context> {
  public:
@@ -141,6 +168,8 @@ class FlattenOp : public Operator<Context> {
     auto& input = Input(0);
     auto* output = Output(0);
     DCHECK_GT(input.size(), 0);
+    CAFFE_ENFORCE_GE(
+        input.dims().size(), 2, "The rank of the tensor must be >= 2.");
     output->Resize(input.dim(0), input.size() / input.dim(0));
     context_.template CopyItems<Context, Context>(
         input.meta(),
@@ -161,6 +190,8 @@ class FlattenToVecOp : public Operator<Context> {
     auto& input = Input(0);
     auto* output = Output(0);
     DCHECK_GT(input.size(), 0);
+    CAFFE_ENFORCE_GE(
+        input.dims().size(), 1, "The rank of the tensor must be >= 1.");
     output->Resize(input.size());
 
     context_.template CopyItems<Context, Context>(
@@ -374,7 +405,7 @@ class ScatterWeightedSumOp : public Operator<Context> {
         Index idx = idxs[i];
         DCHECK(0 <= idx && idx < N) << "Index out of bounds: " << idx
                                     << ", range 0 to " << N;
-        math::Scale<T, Context, FixedSize>(
+        math::ScaleFixedSize<T, Context, FixedSize>(
             block_size,
             w0,
             data + block_size * idx,
@@ -394,7 +425,7 @@ class ScatterWeightedSumOp : public Operator<Context> {
         // double-checking the indices, but it's fine as it's DCHECK only
         DCHECK(0 <= idx && idx < N) << "Index out of bounds: " << idx
                                     << ", range 0 to " << N;
-        math::Axpy<T, Context, FixedSize>(
+        math::AxpyFixedSize<T, Context, FixedSize>(
             block_size,
             w,
             x_data + block_size * i,
@@ -402,6 +433,56 @@ class ScatterWeightedSumOp : public Operator<Context> {
             &context_);
       }
     }
+    return true;
+  }
+};
+
+template <typename T, class Context>
+class SumElementsOp : public Operator<Context> {
+ public:
+  USE_SIMPLE_CTOR_DTOR(SumElementsOp);
+  USE_OPERATOR_CONTEXT_FUNCTIONS;
+
+  bool RunOnDevice() override {
+    bool average = OperatorBase::GetSingleArgument<bool>("average", false);
+    auto& X = Input(0);
+    auto* sum = Output(0);
+    sum->Resize(vector<TIndex>());
+    math::Sum<T, Context>(
+        X.size(),
+        X.template data<T>(),
+        sum->template mutable_data<T>(),
+        &context_);
+    if (average) {
+      math::Scale<T, Context>(
+          1,
+          static_cast<T>(1.) / X.size(),
+          sum->template data<T>(),
+          sum->template mutable_data<T>(),
+          &context_);
+    }
+    return true;
+  }
+};
+
+template <typename T, class Context>
+class SumElementsGradientOp final : public Operator<Context> {
+ public:
+  USE_SIMPLE_CTOR_DTOR(SumElementsGradientOp);
+  USE_OPERATOR_CONTEXT_FUNCTIONS;
+
+  bool RunOnDevice() override {
+    bool average = OperatorBase::GetSingleArgument<bool>("average", false);
+    auto& X = Input(0);
+    TensorCPU sum_grad = TensorCPU(Input(1));
+    auto* dX = Output(0);
+    dX->ResizeLike(X);
+    DCHECK_EQ(sum_grad.size(), 1);
+    math::Set<T, Context>(
+        dX->size(),
+        static_cast<T>(sum_grad.data<T>()[0] * (average ? 1.0 / X.size() : 1)),
+        dX->template mutable_data<T>(),
+        &context_);
     return true;
   }
 };
@@ -436,16 +517,10 @@ class MaxOp : public Operator<Context> {
           output->dims());
     }
 
-    T* output_data = output->template mutable_data<T>();
-    for (int i = 1; i < InputSize(); i++) {
-      auto input_data = Input(i).template data<T>();
-      for (int j = 0; j < input0.size(); j++) {
-        output_data[j] = std::max(output_data[j], input_data[j]);
-      }
-    }
-
-    return true;
+    return Compute();
   }
+
+  virtual bool Compute();
 };
 
 template <typename T, class Context>
@@ -454,32 +529,7 @@ class MaxGradientOp : public Operator<Context> {
   USE_OPERATOR_CONTEXT_FUNCTIONS;
   USE_SIMPLE_CTOR_DTOR(MaxGradientOp);
 
-  bool RunOnDevice() override {
-    auto& output = Input(0);
-    auto& grad_output = Input(1);
-    const int kInputStartOffset = 2;
-
-    const T* data = output.template data<T>();
-    ConstEigenArrayMap<T> output_array(
-        output.template data<T>(), 1, output.size());
-    ConstEigenArrayMap<T> grad_out_array(
-        grad_output.template data<T>(), 1, grad_output.size());
-
-    for (int i = 0; i < OutputSize(); i++) {
-      auto& input = Input(i + kInputStartOffset);
-      ConstEigenArrayMap<T> input_array(
-          input.template data<T>(), 1, input.size());
-
-      auto* grad_input = Output(i);
-      grad_input->ResizeLike(input);
-      EigenArrayMap<T> grad_in_array(
-          grad_input->template mutable_data<T>(), 1, grad_input->size());
-      grad_in_array = grad_out_array *
-          input_array.cwiseEqual(output_array).template cast<T>();
-    }
-
-    return true;
-  }
+  bool RunOnDevice() override;
 };
 
 /**
@@ -545,7 +595,6 @@ class ScatterAssignOp : public Operator<Context> {
     T* data = output->template mutable_data<T>();
     const Index* idxs = indices.template data<Index>();
     const T* slicesData = slices.template data<T>();
-    CAFFE2_OMP_PARALLEL_FOR()
     for (int i = 0; i < K; ++i) {
       Index idx = idxs[i];
       // double-checking the indices, but it's fine as it's DCHECK only
@@ -576,6 +625,13 @@ class CopyOp : public Operator<Context> {
         output->raw_mutable_data(input.meta()));
     return true;
   }
+};
+
+template <class Context, class DstContext, class SrcContext>
+class CopyOnDeviceLikeOp : public CopyOp<Context, DstContext, SrcContext> {
+ public:
+  CopyOnDeviceLikeOp(const OperatorDef& operator_def, Workspace* ws)
+      : CopyOp<Context, DstContext, SrcContext>(operator_def, ws) {}
 };
 
 template <class Context>
@@ -970,131 +1026,15 @@ class ShapeOp : public Operator<Context> {
 
   bool RunOnDevice() override {
     auto& input = Input(0);
-    auto* output = OperatorBase::Output<TensorCPU>(0);
+    auto* output = OperatorBase::Output<Tensor<Context>>(0);
     output->Resize(input.ndim());
     TIndex* output_data = output->template mutable_data<TIndex>();
-    for (int i = 0; i < input.ndim(); ++i) {
-      output_data[i] = input.dim(i);
-    }
+    context_.template CopyBytes<Context, Context>(
+        input.ndim() * sizeof(TIndex), input.dims().data(), output_data);
     return true;
   }
 };
 
-// Takes a shape and data tensor and reshapes it
-template <typename F, class Context>
-class ReshapeOp : public Operator<Context> {
- public:
-  USE_OPERATOR_CONTEXT_FUNCTIONS;
-  ReshapeOp(const OperatorDef& operator_def, Workspace* ws)
-      : Operator<Context>(operator_def, ws),
-        new_shape_(OperatorBase::GetRepeatedArgument<int64_t>("shape")) {}
-
-  bool RunOnDevice() override {
-    if (InputSize() == 2) {
-      return DispatchHelper<TensorTypes<int, int64_t>>::call(this, Input(1));
-    }
-    CAFFE_ENFORCE(
-        OperatorBase::HasArgument("shape"), "Argument `shape` is missing.");
-    return this->template DoRunWithType<int64_t>();
-  }
-
-  template <typename T>
-  bool DoRunWithType() {
-    auto& input = Input(0);
-    CAFFE_ENFORCE(input.ndim() >= 1, "DATA should be at least 1-D");
-
-    vector<int64_t> actual_new_shape = new_shape_;
-    if (InputSize() == 2) {
-      CAFFE_ENFORCE(
-          !OperatorBase::HasArgument("shape"),
-          "New shape is specified by the input blob, do not pass in "
-          "the argument `shape`.");
-
-      auto& shape = Input(1);
-      CAFFE_ENFORCE(shape.ndim() == 1, "Shape should be 1-D");
-
-      const T* shape_data = shape.template data<T>();
-
-      // Bit awkward, but needed so works on both CPU and CUDA contexts
-      std::vector<T> tmpv(shape.size());
-      context_.template CopyBytes<Context, CPUContext>(
-          shape.size() * sizeof(T), shape_data, &tmpv[0]);
-      actual_new_shape.assign(tmpv.begin(), tmpv.begin() + shape.size());
-    }
-
-    // Copy over the dimensions for those that are specified zero.
-    for (int i = 0; i < actual_new_shape.size(); ++i) {
-      if (actual_new_shape[i] == 0) {
-        actual_new_shape[i] = input.dim(i);
-      }
-    }
-
-    // Checks if the new shape is valid and fills in the missing dimension
-    // specified by -1.
-    // NOTE: At most one dimension can be -1.
-    auto total_size = input.size_from_dim(0);
-    T size = 1;
-    int unknown_idx = -1;
-    for (int i = 0; i < actual_new_shape.size(); ++i) {
-      const auto dim = actual_new_shape[i];
-      if (dim == -1) {
-        CAFFE_ENFORCE(
-            unknown_idx == -1,
-            "Argument `shape` has more than one missing dimension.");
-        unknown_idx = i;
-      } else {
-        size *= dim;
-      }
-    }
-
-    if (unknown_idx != -1) {
-      CAFFE_ENFORCE(
-          total_size % size == 0,
-          "Argument `shape` does not agree with the input data.",
-          " (",
-          total_size,
-          " vs ",
-          size,
-          ")");
-      actual_new_shape[unknown_idx] = total_size / size;
-    } else {
-      CAFFE_ENFORCE_EQ(
-          total_size,
-          size,
-          "Argument `shape` does not agree with the input data.",
-          " (",
-          total_size,
-          " != ",
-          size,
-          ")");
-    }
-
-    // Write the original shape to the second output.
-    auto* old_shape = Output(1);
-    old_shape->Resize(input.ndim());
-    T* old_shape_data = old_shape->template mutable_data<T>();
-    for (int i = 0; i < input.ndim(); ++i) {
-      math::Set<T, Context>(1, input.dim(i), old_shape_data + i, &context_);
-    }
-
-    auto* output = Output(0);
-    output->Resize(actual_new_shape);
-    if (output != &input) {
-      // If we are not doing in-place computation, a copy is needed.
-      context_.template CopyBytes<Context, Context>(
-          input.nbytes(),
-          input.raw_data(),
-          output->raw_mutable_data(input.meta()));
-    }
-
-    return true;
-  }
-
- private:
-  vector<int64_t> new_shape_;
-};
-
-// Takes a length vector, check that all lengths are equal and
 // returns a shape to be passed to Reshape
 template <class Context>
 class LengthsToShapeOp : public Operator<Context> {
@@ -1484,6 +1424,68 @@ class UnsafeCoalesceOp final : public Operator<Context> {
   }
 };
 
+template <typename T, class Context>
+class AccumulateHistogramOp : public Operator<Context> {
+ public:
+  AccumulateHistogramOp(const OperatorDef& def, Workspace* ws)
+      : Operator<Context>(def, ws),
+        lower_bound_(
+            OperatorBase::GetSingleArgument<float>("lower_bound", 0.0)),
+        upper_bound_(
+            OperatorBase::GetSingleArgument<float>("upper_bound", 1.0)),
+        num_buckets_(OperatorBase::GetSingleArgument<int>("num_buckets", 1)) {
+    CAFFE_ENFORCE_GT(num_buckets_, 0);
+    // 2 more for histograms < lower_bound, >= upper_bound respectively
+    num_output_buckets_ = num_buckets_ + 2;
+    accumulate_hist_ = std::vector<int64_t>(num_output_buckets_, 0);
+  }
+
+  USE_OPERATOR_CONTEXT_FUNCTIONS;
+
+  bool RunOnDevice() override {
+    auto& X = Input(X_IN);
+    auto* X_data = X.template data<T>();
+    int N = X.size();
+    auto* cur_hist = Output(CUR_HIST);
+    auto* acc_hist = Output(ACC_HIST);
+    cur_hist->Resize(num_output_buckets_);
+    acc_hist->Resize(num_output_buckets_);
+    auto* cur_hist_data = cur_hist->template mutable_data<int64_t>();
+    auto* acc_hist_data = acc_hist->template mutable_data<int64_t>();
+    auto segment = (upper_bound_ - lower_bound_) / num_buckets_;
+    math::Set<int64_t, Context>(
+        num_output_buckets_, 0, cur_hist_data, &context_);
+
+    for (int i = 0; i < N; i++) {
+      int bucket_index = -1;
+      if (X_data[i] < lower_bound_) {
+        bucket_index = 0;
+      } else if (X_data[i] >= upper_bound_) {
+        bucket_index = num_buckets_ + 1;
+      } else {
+        bucket_index = (int)((X_data[i] - lower_bound_) / segment) + 1;
+      }
+      cur_hist_data[bucket_index] += 1;
+      accumulate_hist_[bucket_index] += 1;
+    }
+
+    for (int i = 0; i < num_output_buckets_; i++) {
+      acc_hist_data[i] = accumulate_hist_[i];
+    }
+
+    return true;
+  }
+
+ private:
+  float lower_bound_;
+  float upper_bound_;
+  int num_buckets_;
+  int num_output_buckets_;
+  std::vector<int64_t> accumulate_hist_;
+
+  INPUT_TAGS(X_IN);
+  OUTPUT_TAGS(CUR_HIST, ACC_HIST);
+};
 } // namespace caffe2
 
 #endif // CAFFE2_OPERATORS_UTILITY_OPS_H_

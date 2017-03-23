@@ -1,22 +1,48 @@
 # Finds Google Protocol Buffers library and compilers and extends
 # the standard cmake script with version and python generation support
-
-if (ANDROID OR IOS)
+function(custom_protobuf_find)
+  # For a custom protobuf build, we will always use static protobuf.
   option(protobuf_BUILD_SHARED_LIBS "" OFF)
   option(protobuf_BUILD_TESTS "" OFF)
   option(protobuf_BUILD_EXAMPLES "" OFF)
+  # MSVC protobuf built with static library explicitly uses /MT and /MTd which
+  # makes things a bit tricky, so we set it off.
+  #option(protobuf_MSVC_STATIC_RUNTIME "" OFF)
   if (APPLE)
     # Protobuf generated files triggers a deprecated atomic operation warning
     # so we turn it off here.
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations" PARENT_SCOPE)
   endif()
   add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/protobuf/cmake)
   include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third_party/protobuf/src)
   list(APPEND Caffe2_DEPENDENCY_LIBS libprotobuf)
+  set(Caffe2_DEPENDENCY_LIBS ${Caffe2_DEPENDENCY_LIBS} PARENT_SCOPE)
+  if(NOT EXISTS ${PROTOBUF_PROTOC_EXECUTABLE})
+    message(FATAL_ERROR
+            "To build protobufs locally (required for Android/iOS/Windows), "
+            "you will need to manually specify a PROTOBUF_PROTOC_EXECUTABLE. "
+            "See scripts/build_host_protoc.{sh,bat} for more details.")
+  else()
+    message(STATUS "Using protobuf compiler ${PROTOBUF_PROTOC_EXECUTABLE}.")
+  endif()
+  set(Protobuf_FOUND TRUE PARENT_SCOPE)
+endfunction()
+
+if (ANDROID OR IOS OR WIN32)
+  custom_protobuf_find()
 else()
-  find_package( Protobuf REQUIRED )
-  list(APPEND Caffe2_DEPENDENCY_LIBS ${PROTOBUF_LIBRARIES})
-  include_directories(SYSTEM ${PROTOBUF_INCLUDE_DIR})
+  find_package( Protobuf )
+  if ( NOT (Protobuf_FOUND OR PROTOBUF_FOUND) )
+    custom_protobuf_find()
+  else()
+    # Adding PROTOBUF_LIBRARY for legacy support.
+    list(APPEND Caffe2_DEPENDENCY_LIBS ${PROTOBUF_LIBRARIES} ${PROTOBUF_LIBRARY})
+    include_directories(SYSTEM ${PROTOBUF_INCLUDE_DIR})
+  endif()
+endif()
+
+if (NOT (Protobuf_FOUND OR PROTOBUF_FOUND) )
+  message(FATAL_ERROR "Could not find Protobuf or compile local version.")
 endif()
 
 # place where to generate protobuf sources

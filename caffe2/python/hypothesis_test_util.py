@@ -44,6 +44,7 @@ import copy
 import hypothesis
 import hypothesis.extra.numpy
 import hypothesis.strategies as st
+import logging
 import numpy as np
 import os
 
@@ -90,7 +91,7 @@ def dims(min_value=1, max_value=5):
 
 def elements_of_type(dtype=np.float32, filter_=None):
     elems = None
-    if dtype in (np.float32, np.float64):
+    if dtype in (np.float16, np.float32, np.float64):
         elems = st.floats(min_value=-1.0, max_value=1.0)
     elif dtype is np.int32:
         elems = st.integers(min_value=0, max_value=2 ** 31 - 1)
@@ -243,9 +244,11 @@ def runOpBenchmark(
     device_option,
     op,
     inputs,
-    input_device_options={},
+    input_device_options=None,
     iterations=10,
 ):
+    if input_device_options is None:
+        input_device_options = {}
     op = copy.deepcopy(op)
     op.device_option.CopyFrom(device_option)
     net = caffe2_pb2.NetDef()
@@ -342,7 +345,10 @@ class HypothesisTestCase(test_util.TestCase):
             input_device_options=input_device_options
         )
         self.assertEqual(grad.shape, grad_estimated.shape)
-        self.assertTrue(res, "Gradient checks failed")
+        self.assertTrue(
+            res,
+            "Gradient check failed for input " + str(op.input[outputs_to_check])
+        )
 
     def _assertGradReferenceChecks(
         self,
@@ -392,13 +398,56 @@ class HypothesisTestCase(test_util.TestCase):
                     np.testing.assert_allclose(indices, ref_indices,
                                                atol=1e-4, rtol=1e-4)
 
+    def _assertInferTensorChecks(self, name, shapes, types, output):
+        if name not in shapes:
+            # No inferred shape or type available
+            return
+        output = workspace.FetchBlob(name)
+        if type(output) is np.ndarray:
+            if output.dtype == np.dtype('float64'):
+                correct_type = caffe2_pb2.TensorProto.DOUBLE
+            elif output.dtype == np.dtype('float32'):
+                correct_type = caffe2_pb2.TensorProto.FLOAT
+            elif output.dtype == np.dtype('int32'):
+                correct_type = caffe2_pb2.TensorProto.INT32
+            elif output.dtype == np.dtype('int64'):
+                correct_type = caffe2_pb2.TensorProto.INT64
+            else:
+                correct_type = "unknown {}".format(np.dtype)
+        else:
+            correct_type = str(type(output))
+        try:
+            np.testing.assert_array_equal(
+                np.array(shapes[name]).astype(np.int32),
+                np.array(output.shape).astype(np.int32),
+                err_msg='Shape {} mismatch: {} vs. {}'.format(
+                    name,
+                    shapes[name],
+                    output.shape))
+            # BUG: Workspace blob type not being set correctly T16121392
+            if correct_type != caffe2_pb2.TensorProto.INT32:
+                return
+            np.testing.assert_equal(
+                types[name],
+                correct_type,
+                err_msg='Type {} mismatch: {} vs. {}'.format(
+                    name, types[name], correct_type,
+                )
+            )
+        except AssertionError as e:
+            # Temporarily catch these assertion errors when validating
+            # inferred shape and type info
+            logging.warning(str(e))
+            if os.getenv('CAFFE2_ASSERT_SHAPEINFERENCE') == '1':
+                raise e
+
     def assertReferenceChecks(
         self,
         device_option,
         op,
         inputs,
         reference,
-        input_device_options={},
+        input_device_options=None,
         threshold=1e-4,
         output_to_grad=None,
         grad_reference=None,
@@ -426,6 +475,9 @@ class HypothesisTestCase(test_util.TestCase):
 
                 self.assertReferenceChecks(gc, op, [X], softsign)
         """
+        if input_device_options is None:
+            input_device_options = {}
+
         op = copy.deepcopy(op)
         op.device_option.CopyFrom(device_option)
 
@@ -436,7 +488,20 @@ class HypothesisTestCase(test_util.TestCase):
                     b,
                     device_option=input_device_options.get(n, device_option)
                 )
-            workspace.RunOperatorOnce(op)
+                print("Input", n, input_device_options.get(n, device_option))
+            net = core.Net("opnet")
+            net.Proto().op.extend([op])
+            test_shape_inference = False
+            try:
+                (shapes, types) = workspace.InferShapesAndTypes([net])
+                test_shape_inference = True
+            except RuntimeError as e:
+                # Temporarily catch runtime errors when inferring shape
+                # and type info
+                logging.warning(str(e))
+                if os.getenv('CAFFE2_ASSERT_SHAPEINFERENCE') == '1':
+                    raise e
+            workspace.RunNetOnce(net)
             reference_outputs = reference(*inputs)
             if not (isinstance(reference_outputs, tuple) or
                     isinstance(reference_outputs, list)):
@@ -462,11 +527,15 @@ class HypothesisTestCase(test_util.TestCase):
                                 output_blob_name,
                             )),
                     )
+                if test_shape_inference:
+                    self._assertInferTensorChecks(
+                        output_blob_name, shapes, types, output)
                 outs.append(output)
             if grad_reference and output_to_grad:
-                self._assertGradReferenceChecks(
-                    op, inputs, reference_outputs,
-                    output_to_grad, grad_reference)
+                with core.DeviceScope(device_option):
+                    self._assertGradReferenceChecks(
+                        op, inputs, reference_outputs,
+                        output_to_grad, grad_reference)
             return outs
 
     def assertValidationChecks(
@@ -475,9 +544,11 @@ class HypothesisTestCase(test_util.TestCase):
         op,
         inputs,
         validator,
-        input_device_options={},
+        input_device_options=None,
         as_kwargs=True
     ):
+        if input_device_options is None:
+            input_device_options = {}
         if as_kwargs:
             assert len(set(list(op.input) + list(op.output))) == \
                 len(op.input) + len(op.output), \

@@ -57,12 +57,13 @@ class ImageInputOp final
   bool warp_;
   int crop_;
   bool mirror_;
+  bool is_test_;
   bool use_caffe_datum_;
   bool gpu_transform_;
 
   // thread pool for parse + decode
   int num_decode_threads_;
-  std::shared_ptr<ThreadPool> thread_pool_;
+  std::shared_ptr<TaskThreadPool> thread_pool_;
 };
 
 
@@ -80,13 +81,14 @@ ImageInputOp<Context>::ImageInputOp(
         warp_(OperatorBase::template GetSingleArgument<int>("warp", 0)),
         crop_(OperatorBase::template GetSingleArgument<int>("crop", -1)),
         mirror_(OperatorBase::template GetSingleArgument<int>("mirror", 0)),
+        is_test_(OperatorBase::template GetSingleArgument<int>("is_test", 0)),
         use_caffe_datum_(OperatorBase::template GetSingleArgument<int>(
               "use_caffe_datum", 0)),
         gpu_transform_(OperatorBase::template GetSingleArgument<int>(
               "use_gpu_transform", 0)),
         num_decode_threads_(OperatorBase::template GetSingleArgument<int>(
               "decode_threads", 4)),
-        thread_pool_(new ThreadPool(num_decode_threads_))
+        thread_pool_(new TaskThreadPool(num_decode_threads_))
 {
   if (operator_def.input_size() == 0) {
     LOG(ERROR) << "You are using an old ImageInputOp format that creates "
@@ -117,7 +119,7 @@ ImageInputOp<Context>::ImageInputOp(
             << (color_ ? "color " : "grayscale ") << "image;";
   LOG(INFO) << "    Scaling image to " << scale_
             << (warp_ ? " with " : " without ") << "warping;";
-  LOG(INFO) << "    Cropping image to " << crop_
+  LOG(INFO) << "    " << (is_test_ ? "Central" : "Random") << " cropping image to " << crop_
             << (mirror_ ? " with " : " without ") << "random mirroring;";
   LOG(INFO) << "    Subtract mean " << mean_ << " and divide by std " << std_
             << ".";
@@ -233,9 +235,6 @@ bool ImageInputOp<Context>::GetImageAndLabelFromDBValue(
     }
   }
 
-  CAFFE_ENFORCE_GE(src.rows, crop_, "Image height must be bigger than crop.");
-  CAFFE_ENFORCE_GE(src.cols, crop_, "Image width must be bigger than crop.");
-
   //
   // convert source to the color format requested from Op
   //
@@ -264,14 +263,28 @@ void TransformImage(
     const float mean,
     const float std,
     std::mt19937* randgen,
-    std::bernoulli_distribution* mirror_this_image) {
+    std::bernoulli_distribution* mirror_this_image,
+    bool is_test = false) {
+
+  CAFFE_ENFORCE_GE(
+      scaled_img.rows, crop, "Image height must be bigger than crop.");
+  CAFFE_ENFORCE_GE(
+      scaled_img.cols, crop, "Image width must be bigger than crop.");
+
   // find the cropped region, and copy it to the destination matrix with
   // mean subtraction and scaling.
-  int width_offset =
+  int width_offset, height_offset;
+  if (is_test) {
+    width_offset = (scaled_img.cols - crop) / 2;
+    height_offset = (scaled_img.rows - crop) / 2;
+  } else {
+    width_offset =
       std::uniform_int_distribution<>(0, scaled_img.cols - crop)(*randgen);
-  int height_offset =
+    height_offset =
       std::uniform_int_distribution<>(0, scaled_img.rows - crop)(*randgen);
+  }
   float std_inv = 1.f / std;
+
   if (mirror && (*mirror_this_image)(*randgen)) {
     // Copy mirrored image.
     for (int h = height_offset; h < height_offset + crop; ++h) {
@@ -299,16 +312,28 @@ void TransformImage(
 // leave in uint8_t dataType
 template <class Context>
 void CropTransposeImage(const cv::Mat& scaled_img, const int channels,
-                        uint8_t *cropped_data, const int crop, const bool mirror,
-                        std::mt19937 *randgen,
-                        std::bernoulli_distribution *mirror_this_image) {
+                        uint8_t *cropped_data, const int crop,
+                        const bool mirror, std::mt19937 *randgen,
+                        std::bernoulli_distribution *mirror_this_image,
+                        bool is_test = false) {
+  CAFFE_ENFORCE_GE(
+      scaled_img.rows, crop, "Image height must be bigger than crop.");
+  CAFFE_ENFORCE_GE(
+      scaled_img.cols, crop, "Image width must be bigger than crop.");
 
   // find the cropped region, and copy it to the destination matrix with
   // mean subtraction and scaling.
-  int width_offset =
+  int width_offset, height_offset;
+  if (is_test) {
+    width_offset = (scaled_img.cols - crop) / 2;
+    height_offset = (scaled_img.rows - crop) / 2;
+  } else {
+    width_offset =
       std::uniform_int_distribution<>(0, scaled_img.cols - crop)(*randgen);
-  int height_offset =
+    height_offset =
       std::uniform_int_distribution<>(0, scaled_img.rows - crop)(*randgen);
+  }
+
   if (mirror && (*mirror_this_image)(*randgen)) {
     // Copy mirrored image.
     for (int h = height_offset; h < height_offset + crop; ++h) {
@@ -365,7 +390,7 @@ void ImageInputOp<Context>::DecodeAndTransform(
 
   // Factor out the image transformation
   TransformImage<Context>(scaled_img, channels, image_data, crop_, mirror_,
-                          mean_, std_, randgen, mirror_this_image);
+                          mean_, std_, randgen, mirror_this_image, is_test_);
 }
 
 template <class Context>
@@ -400,7 +425,7 @@ void ImageInputOp<Context>::DecodeAndTransposeOnly(
 
   // Factor out the image transformation
   CropTransposeImage<Context>(scaled_img, channels, image_data, crop_, mirror_,
-                              randgen, mirror_this_image);
+                              randgen, mirror_this_image, is_test_);
 }
 
 
@@ -421,6 +446,7 @@ bool ImageInputOp<Context>::Prefetch() {
     prefetched_image_.mutable_data<float>();
   }
 
+  prefetched_label_.mutable_data<int>();
   // Prefetching handled with a thread pool of "decode_threads" threads.
   std::mt19937 meta_randgen(time(nullptr));
   std::vector<std::mt19937> randgen_per_thread;

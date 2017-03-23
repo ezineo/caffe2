@@ -23,7 +23,7 @@ namespace caffe2 {
 class OperatorBase {
  public:
   explicit OperatorBase(const OperatorDef& operator_def, Workspace* ws);
-  virtual ~OperatorBase() {}
+  virtual ~OperatorBase() noexcept {}
 
   /** @brief Checks if the operator has an argument of the given name.
    */
@@ -35,15 +35,15 @@ class OperatorBase {
   // argument name to a specific type of argument that we are trying to access.
   template <typename T>
   inline T GetSingleArgument(const string& name, const T& default_value) const {
-    return arg_helper_.GetSingleArgument<T>(name, default_value);
+    return arg_helper_.template GetSingleArgument<T>(name, default_value);
   }
   template <typename T>
   inline bool HasSingleArgumentOfType(const string& name) const {
-    return arg_helper_.HasSingleArgumentOfType<T>(name);
+    return arg_helper_.template HasSingleArgumentOfType<T>(name);
   }
   template <typename T>
   inline vector<T> GetRepeatedArgument(const string& name) const {
-    return arg_helper_.GetRepeatedArgument<T>(name);
+    return arg_helper_.template GetRepeatedArgument<T>(name);
   }
 
   // Get the inputs and outputs as specific types.
@@ -88,10 +88,13 @@ class OperatorBase {
   inline const vector<const Blob*>& Inputs() const { return inputs_; }
   inline const vector<Blob*>& Outputs() { return outputs_; }
 
-  virtual bool Run() {
+  virtual bool Run(int /* unused */ stream_id = 0) {
     CAFFE_NOT_IMPLEMENTED;
   }
-  virtual bool RunAsync() { return Run(); }
+
+  virtual bool RunAsync(int /* unused */ stream_id = 0) {
+    return Run(stream_id);
+  }
 
   inline const OperatorDef& def() const {
     return operator_def_;
@@ -114,7 +117,7 @@ class OperatorBase {
 #define USE_SIMPLE_BASE_CTOR_DTOR(name)                                        \
   name(const OperatorDef& operator_def, Workspace* ws)                         \
       : OperatorBase(operator_def, ws) {}                                      \
-  virtual ~name() {}
+  virtual ~name() noexcept {}
 
 // OP_SINGLE_ARG provides a shorter initialization choice for initialization of
 // member variables for the class constructors.
@@ -148,9 +151,9 @@ class Operator : public OperatorBase {
         context_(operator_def.device_option()) {
     // In the constructor, we switch to the device so that the child class
     // constructors will run on that device.
-    context_.SwitchToDevice();
+    context_.SwitchToDevice(0);
   }
-  virtual ~Operator() {}
+  virtual ~Operator() noexcept {}
 
   inline const Tensor<Context>& Input(int idx) {
     return OperatorBase::template Input<Tensor<Context> >(idx); }
@@ -161,9 +164,9 @@ class Operator : public OperatorBase {
   // The run function of Operator switches to the device, and then carries out
   // the actual computation with RunOnDevice(). You should implement RunOnDevice
   // instead of Run().
-  bool Run() final {
+  bool Run(int stream_id = 0) final {
     try {
-      context_.SwitchToDevice();
+      context_.SwitchToDevice(stream_id);
       bool started = RunOnDevice();
       bool finished = context_.FinishDeviceComputation();
       if (!finished) {
@@ -180,9 +183,9 @@ class Operator : public OperatorBase {
     }
   }
 
-  bool RunAsync() final {
+  bool RunAsync(int stream_id = 0) final {
     try {
-      context_.SwitchToDevice();
+      context_.SwitchToDevice(stream_id);
       return RunOnDevice();
     } catch (EnforceNotMet& err) {
       err.AppendMessage("Error from operator: \n" + ProtoDebugString(def()));
@@ -217,7 +220,7 @@ class Operator : public OperatorBase {
 #define USE_SIMPLE_CTOR_DTOR(name)                                             \
   name(const OperatorDef& operator_def, Workspace* ws)                         \
       : Operator<Context>(operator_def, ws) {}                                 \
-  virtual ~name() {}
+  virtual ~name() noexcept {}
 
 // Helpers to implement runtime op polymorphism. Often it's convenient to make
 // an op work on different input types (e.g. i32 vs i64 indices) or special-case
@@ -401,9 +404,9 @@ class UnsupportedOperatorFeature : public std::exception {
 // A helper macro that should ONLY be used in the operator constructor to check
 // if needed features are met. If not, throws the UnsupportedOperatorFeature
 // exception with the given message.
-#define OPERATOR_NEEDS_FEATURE(condition, message) \
-  if (!(condition)) {                              \
-    throw UnsupportedOperatorFeature(message);     \
+#define OPERATOR_NEEDS_FEATURE(condition, ...)                           \
+  if (!(condition)) {                                                    \
+    throw UnsupportedOperatorFeature(::caffe2::MakeString(__VA_ARGS__)); \
   }
 
 // Creates an operator with the given operator definition.

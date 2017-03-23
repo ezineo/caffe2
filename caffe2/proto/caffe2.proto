@@ -62,6 +62,16 @@ message TensorProto {
   optional Segment segment = 11;
 }
 
+message QTensorProto {
+  repeated int64 dims = 1;
+  required int32 precision = 2;
+  required double scale = 3;
+  required double bias = 4;
+  required bool is_signed = 5;
+  repeated int32 data = 6 [packed = true];
+  optional string name = 7;
+}
+
 // TensorProtos stores multiple TensorProto objects in one single proto. This
 // is useful for small tensors; For anything big, consider using a DB for
 // storage.
@@ -146,6 +156,10 @@ message OperatorDef {
   // Operator implementation, and are only used by the Net class for
   // scheduling purposes.
   repeated string control_input = 8;
+
+  // is_gradient_op argument is only used as a hint in shape inference
+  // and has no runtime significance
+  optional bool is_gradient_op = 9 [default = false];
 }
 
 // Network definition.
@@ -219,11 +233,14 @@ message ExecutionStep {
   // execution terminates when the output[0] is `false`.
   optional string criteria_network = 5 [deprecated=true];
 
-  // If specified, run report_net asynchronously every `report_interval`
-  // seconds. Report_net is guaranteed to run at least once after all
-  // substeps have finished.
+  // DEPRECATED. Use `run_every_ms`.
   optional string report_net = 7;
   optional int32 report_interval = 8;
+
+  // If provided, execute this step at every time interval (in millisecs)
+  // while its sibiling execution steps execute in parallel. This step is
+  // guaranteed to run at least once after all non-interval siblings finished.
+  optional int64 run_every_ms = 11;
 
   // If false or not set, execute sub-steps serially.
   // If true, execute all substeps concurrently, each one in a separte thread.
@@ -266,7 +283,8 @@ message BlobProto {
   optional string name = 1;
   optional string type = 2;
   optional TensorProto tensor = 3;
-  optional string content = 4;
+  optional bytes content = 4;
+  optional QTensorProto qtensor = 5;
 }
 
 // Protobuf format to serialize DBReader.

@@ -1,17 +1,35 @@
 #ifndef CAFFE2_CORE_COMMON_H_
 #define CAFFE2_CORE_COMMON_H_
 
+#include <algorithm>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
-#include <string>
 #include <sstream>
+#include <string>
 #include <type_traits>
 #include <vector>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
+
+#if defined(_MSC_VER)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+// Caffe2 version. The plan is to increment the minor version every other week
+// as a track point for bugs, until we find a proper versioning cycle.
+
+#define CAFFE2_VERSION_MAJOR 0
+#define CAFFE2_VERSION_MINOR 5
+#define CAFFE2_VERSION_PATCH 0
+#define CAFFE2_VERSION                                         \
+  (CAFFE2_VERSION_MAJOR * 10000 + CAFFE2_VERSION_MINOR * 100 + \
+   CAFFE2_VERSION_PATCH)
 
 namespace caffe2 {
 
@@ -68,6 +86,36 @@ private:                                                                       \
 #define CAFFE2_MOBILE 0
 #endif // ANDROID / IOS / MACOS
 #endif // CAFFE2_MOBILE
+
+// Define alignment macro that is cross platform
+#if defined(_MSC_VER)
+#define CAFFE2_ALIGNED(x) __declspec(align(x))
+#else
+#define CAFFE2_ALIGNED(x) __attribute__((aligned(x)))
+#endif
+
+/**
+ * Macro for marking functions as having public visibility.
+ * Ported from folly/CPortability.h
+ */
+#ifndef __GNUC_PREREQ
+#if defined __GNUC__ && defined __GNUC_MINOR__
+#define __GNUC_PREREQ(maj, min) \
+  ((__GNUC__ << 16) + __GNUC_MINOR__ >= ((maj) << 16) + (min))
+#else
+#define __GNUC_PREREQ(maj, min) 0
+#endif
+#endif
+
+#if defined(__GNUC__)
+#if __GNUC_PREREQ(4, 9)
+#define CAFFE2_EXPORT [[gnu::visibility("default")]]
+#else
+#define CAFFE2_EXPORT __attribute__((__visibility__("default")))
+#endif
+#else
+#define CAFFE2_EXPORT
+#endif
 
 // make_unique is a C++14 feature. If we don't have 14, we will emulate
 // its behavior. This is copied from folly/Memory.h

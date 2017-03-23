@@ -4,12 +4,14 @@ from __future__ import print_function
 
 from collections import OrderedDict
 import logging
+import copy
 
 from caffe2.python import model_helper, dyndep, scope, workspace, core, memonger
 from caffe2.proto import caffe2_pb2
 
 dyndep.InitOpsLibrary("@/caffe2/caffe2/contrib/nccl:nccl_ops")
-dyndep.InitOpsLibrary("@/caffe2/caffe2/contrib/fbcollective:fbcollective_ops")
+dyndep.InitOpsLibrary("@/caffe2/caffe2/contrib/gloo:gloo_ops")
+dyndep.InitOpsLibrary("@/caffe2/caffe2/contrib/gloo:gloo_ops_gpu")
 
 log = logging.getLogger("data_parallel_model")
 log.setLevel(logging.INFO)
@@ -64,7 +66,10 @@ def Parallelize_GPU(
     model_helper_obj._grad_names = []
 
     assert isinstance(model_helper_obj, model_helper.ModelHelperBase)
-    assert model_helper_obj.params == [], "Model needs to be empty"
+
+    # Keep track of params that were in the model before: they are not
+    # data parallel, so we need to handle them separately
+    non_datapar_params = copy.copy(model_helper_obj.params)
 
     # Add input and model
     log.info("Create input and model training operators")
@@ -92,11 +97,11 @@ def Parallelize_GPU(
 
     # Create parameter map
     model_helper_obj._device_grouped_blobs =\
-        _GroupByDevice(devices, model_helper_obj.params)
+        _GroupByDevice(devices, model_helper_obj.params, non_datapar_params)
 
     # computed params
     computed_params_grouped =\
-        _GroupByDevice(devices, model_helper_obj.computed_params)
+        _GroupByDevice(devices, model_helper_obj.computed_params, [])
     model_helper_obj._device_grouped_blobs.update(computed_params_grouped)
 
     model_helper_obj._param_names =\
@@ -105,6 +110,7 @@ def Parallelize_GPU(
 
     if (param_update_builder_fun is None):
         log.info("Parameter update function not defined --> only forward")
+        _InferBlobDevice(model_helper_obj)
         return
 
     log.info("Adding gradient operators")
@@ -114,16 +120,22 @@ def Parallelize_GPU(
     param_to_grad = model_helper_obj.param_to_grad
     grads_ordered = [param_to_grad[p] for p in
                      model_helper_obj.params if p in param_to_grad]
+    non_datapar_grads = [param_to_grad[p] for p in non_datapar_params]
+
     gradients_grouped = _GroupByDevice(
         devices,
         grads_ordered,
+        non_datapar_grads
     )
     model_helper_obj._device_grouped_blobs.update(gradients_grouped)
     model_helper_obj._grad_names = gradients_grouped.keys()
 
+    _InferBlobDevice(model_helper_obj)
+
     log.info("Add gradient all-reduces for SyncSGD")
     if broadcast_computed_params:
         _BroadcastComputedParams(devices, model_helper_obj, rendezvous)
+
     _AllReduceGradients(
         devices, model_helper_obj, rendezvous
     )
@@ -140,6 +152,7 @@ def Parallelize_GPU(
             with core.NameScope("gpu_{}".format(device)):
                 param_update_builder_fun(model_helper_obj)
 
+    _InferBlobDevice(model_helper_obj)
     _AnalyzeOperators(model_helper_obj)
 
     # Configure dagnet to run with only one worker on the first iteration,
@@ -166,19 +179,43 @@ def Parallelize_GPU(
 
 
 def _AddGradientOperators(devices, model, losses_by_gpu):
-        def create_grad(lossp):
-            return model.ConstantFill(lossp, str(lossp) + "_grad", value=1.0)
+    def create_grad(lossp):
+        return model.ConstantFill(lossp, str(lossp) + "_grad", value=1.0)
 
-        loss_grad = {}
-        # Explicitly need to create gradients on each GPU
-        for gpu_id in devices:
-            device = core.DeviceOption(caffe2_pb2.CUDA, gpu_id)
-            with core.DeviceScope(device):
-                for l in losses_by_gpu[gpu_id]:
-                    lg = create_grad(l)
-                    loss_grad[str(l)] = str(lg)
+    loss_grad = {}
+    # Explicitly need to create gradients on each GPU
+    for gpu_id in devices:
+        device = core.DeviceOption(caffe2_pb2.CUDA, gpu_id)
+        with core.DeviceScope(device):
+            for l in losses_by_gpu[gpu_id]:
+                lg = create_grad(l)
+                loss_grad[str(l)] = str(lg)
 
-        model.AddGradientOperators(loss_grad)
+    model.AddGradientOperators(loss_grad)
+
+
+def ExtractPredictorNet(model, inputs, outputs, device):
+    '''
+    Returns (net, params) that can be exported to be used as a prediction
+    net.
+    '''
+    master_device = model._devices[0]
+    prefix = "gpu_{}/".format(master_device)
+    prefix_inputs = [prefix + str(b) for b in inputs]
+    prefix_outputs = [prefix + str(b) for b in outputs]
+    predictor_net = model_helper.ExtractPredictorNet(
+        net_proto=model.net.Proto(),
+        input_blobs=prefix_inputs,
+        output_blobs=prefix_outputs,
+        device=device,
+        renames={
+            a: b
+            for (a, b) in zip(prefix_inputs + prefix_outputs, inputs + outputs)
+        }
+    )
+
+    params = set(predictor_net.Proto().external_input) - set(inputs)
+    return (predictor_net, params)
 
 
 def FinalizeAfterCheckpoint(model, blobs, sync_iter=True):
@@ -239,7 +276,10 @@ def _Broadcast(devices, model, net, param):
     # Copy params from gpu_0 to other
     master_gpu = devices[0]
     for gpu_idx in devices[1:]:
-        device_opt = core.DeviceOption(caffe2_pb2.CUDA, gpu_idx)
+        if _IsGPUBlob(model, param):
+            device_opt = core.DeviceOption(caffe2_pb2.CUDA, gpu_idx)
+        else:
+            device_opt = core.DeviceOption(caffe2_pb2.CPU, 0)
         with core.DeviceScope(device_opt):
             net.Copy(
                 model._device_grouped_blobs[param][master_gpu],
@@ -287,10 +327,7 @@ def _AddDistributedParameterSync(
     for param_name in sorted(uniq_param_names):
         param = model._device_grouped_blobs[param_name][devices[0]]
 
-        with core.DeviceScope(device_opt):
-            param_cpu = net.CopyGPUToCPU(param, str(param) + "cpu")
-
-        with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
+        def broadcast(param):
             comm_world = init_net.CreateCommonWorld(
                 rendezvous['kv_handler'],
                 "{}_cw".format(param_name),
@@ -300,14 +337,23 @@ def _AddDistributedParameterSync(
                 engine=rendezvous['engine'],
             )
 
-            # Temp: copy to CPU
             net.Broadcast(
-                inputs=[comm_world, param_cpu],
-                outputs=[param_cpu],
+                inputs=[comm_world, param],
+                outputs=[param],
                 engine=rendezvous['engine'],
             )
-        with core.DeviceScope(device_opt):
-            net.CopyCPUToGPU(param_cpu, param)
+
+        if rendezvous['engine'] == 'GLOO':
+            with core.DeviceScope(device_opt):
+                broadcast(param)
+        else:
+            # Copy between GPU and CPU
+            with core.DeviceScope(device_opt):
+                param_cpu = net.CopyGPUToCPU(param, str(param) + "cpu")
+            with core.DeviceOption(caffe2_pb2.CPU):
+                broadcast(param_cpu)
+            with core.DeviceScope(device_opt):
+                net.CopyCPUToGPU(param_cpu, param)
 
 
 def _AllReduceGradients(devices, model, rendezvous):
@@ -329,11 +375,8 @@ def _AllReduceGradientsDistributed(
     # Make list of gradients in reverse order
     reverse_ordered_grads = _GetReverseOrderedGrads(model)
 
-    # Step 1: sum gradients from local GPUs to master GPU
     master_device_opt = core.DeviceOption(caffe2_pb2.CUDA, devices[0])
     reducing_device_opt = master_device_opt
-    if all_reduce_engine == "FBCOLLECTIVE":
-        reducing_device_opt = core.DeviceOption(caffe2_pb2.CPU, 0)
 
     # We need to specify a partial order using control_input to
     # ensure progress (since all machines need to do same all reduces
@@ -356,60 +399,52 @@ def _AllReduceGradientsDistributed(
         # so we need a temporary gradient blob
         reduced_grad = str(master_grad) + "_red"
 
-        with core.DeviceScope(master_device_opt):
-            model.ConstantFill(master_grad, reduced_grad, value=0.0)
-
-            # Temp fix since NCCLReduce does not work
-            model.net.NCCLAllreduce(
-                grads_group,
-                grads_group,
-                control_input=nccl_control_blob,
-            )
-            nccl_control_blob = grads_group[0]
-            model.net.Copy(master_grad, reduced_grad)
-
-        # FBCOLLECTIVE currently works only on CPU context, so we need
-        # a temporary cpu-bound scratch blob.
-        if all_reduce_engine == "FBCOLLECTIVE":
-            with core.DeviceScope(reducing_device_opt):
-                model.param_init_net.ConstantFill(
-                    [], reduced_grad + "cpu", shape=[1], value=0.0
-                )
-            with core.DeviceScope(master_device_opt):
-                # Hack to ensure the cpu-scratch blob is initialized
-                # prior to running the net.
-                model.param_init_net.CopyGPUToCPU(
-                    str(master_grad).replace("_grad", ""), reduced_grad + "cpu"
-                )
-                model.net.CopyGPUToCPU(reduced_grad, reduced_grad + "cpu")
-                reduced_grad = reduced_grad + "cpu"
-
         control_input = None if len(cyclical_controls) < num_controls \
                         else cyclical_controls[counter % num_controls]
 
-        with core.DeviceScope(reducing_device_opt):
-            # Step 2: allreduce between all hosts, between master GPUs
-            comm_world = model.param_init_net.CreateCommonWorld(
-                rendezvous['kv_handler'],
-                "{}_cw".format(grad_name),
-                name="{}_cw_op".format(grad_name),
-                size=rendezvous['num_shards'],
-                rank=rendezvous['shard_id'],
-                engine=rendezvous['engine'],
-            )
-            model.net.Allreduce(
-                inputs=[comm_world, reduced_grad],
-                outputs=[reduced_grad],
-                engine=all_reduce_engine,
-                control_input=control_input,
-            )
+        def allreduce(grads):
+            with core.DeviceScope(reducing_device_opt):
+                comm_world = model.param_init_net.CreateCommonWorld(
+                    rendezvous['kv_handler'],
+                    "{}_cw".format(grad_name),
+                    name="{}_cw_op".format(grad_name),
+                    size=rendezvous['num_shards'],
+                    rank=rendezvous['shard_id'],
+                    engine=rendezvous['engine'],
+                )
+                model.net.Allreduce(
+                    inputs=[comm_world] + grads,
+                    outputs=grads,
+                    engine=all_reduce_engine,
+                    control_input=control_input,
+                )
 
-        if reducing_device_opt != master_device_opt:
-            with core.DeviceScope(master_device_opt):
-                model.net.CopyCPUToGPU(reduced_grad, master_grad)
+        if rendezvous['engine'] == 'GLOO':
+            # With Gloo cross GPU and cross machine allreduce
+            # can be executed in a single operation
+            allreduce(grads_group)
         else:
+            # Step 1: sum gradients from local GPUs to master GPU
+            with core.DeviceScope(master_device_opt):
+                model.ConstantFill(master_grad, reduced_grad, value=0.0)
+
+                # Temp fix since NCCLReduce does not work
+                model.net.NCCLAllreduce(
+                    grads_group,
+                    grads_group,
+                    control_input=nccl_control_blob,
+                )
+                nccl_control_blob = grads_group[0]
+                model.net.Copy(master_grad, reduced_grad)
+
+            # Step 2: allreduce between all hosts, between master GPUs
+            allreduce([reduced_grad])
+
             with core.DeviceScope(master_device_opt):
                 model.net.Copy(reduced_grad, master_grad)
+
+            # Step 3: broadcast locally
+            _Broadcast(devices, model, model.net, grad_name)
 
         if len(cyclical_controls) < num_controls:
             cyclical_controls.append(reduced_grad)
@@ -417,9 +452,6 @@ def _AllReduceGradientsDistributed(
             cyclical_controls[counter % num_controls] = reduced_grad
 
         counter += 1
-
-        # Step 3: broadcast locally
-        _Broadcast(devices, model, model.net, grad_name)
 
 
 def _AllReduceGradientsSingleHost(devices, model):
@@ -430,6 +462,7 @@ def _AllReduceGradientsSingleHost(devices, model):
 
     # Gradients in reverse order
     reverse_ordered_grads = _GetReverseOrderedGrads(model)
+    assert(len(reverse_ordered_grads) > 0)
 
     # Now we need to Allreduce gradients on all the GPUs.
     # Pick GPU #0 as a master GPU.
@@ -437,19 +470,30 @@ def _AllReduceGradientsSingleHost(devices, model):
     last_out = None
 
     for grad_name in reverse_ordered_grads:
-        with core.DeviceScope(master_device_opt):
-            # Group by grads for reduce.
-            grads_group = model._device_grouped_blobs[grad_name].values()
-            assert len(grads_group) == len(devices), \
-                "Each GPU from {}, should have a copy of {}.".format(
-                    devices, grad_name)
-            model.NCCLAllreduce(
-                grads_group,
-                grads_group,
-                control_input=last_out,
-            )
-            # last_out is used to serialize the execution of nccls
-            last_out = grads_group[0]
+        # Group by grads for reduce.
+        grads_group = model._device_grouped_blobs[grad_name].values()
+        assert len(grads_group) == len(devices), \
+            "Each GPU from {}, should have a copy of {}.".format(
+                devices, grad_name)
+
+        if _IsGPUBlob(model, grad_name):
+            with core.DeviceScope(master_device_opt):
+                assert not isinstance(grads_group[0], core.GradientSlice), \
+                    "GPU sync of gradient slices not implemented"
+                model.NCCLAllreduce(
+                    grads_group,
+                    grads_group,
+                    control_input=last_out,
+                )
+                # last_out is used to serialize the execution of nccls
+                last_out = grads_group[0]
+        else:
+            assert not isinstance(grads_group[0], core.GradientSlice), \
+                "Synchronizing gradient slices not supported"
+            with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
+                # Poor man's allreduce
+                model.Sum(grads_group, grads_group[0])
+                _Broadcast(devices, model, grad_name)
 
 
 def _BroadcastComputedParams(devices, model, rendezvous):
@@ -491,10 +535,13 @@ def _GetReverseOrderedGrads(model):
 
 # A helper function to extract a parameter's name
 def stripParamName(param):
-    # Format is "a/b/c/d" -> d
-    name = str(param)
-    sep = scope._NAMESCOPE_SEPARATOR
-    return name[name.rindex(sep) + 1:]
+    # Format is "a/b/c/d" -> "b/c/d"
+    if isinstance(param, core.GradientSlice):
+        # We index GradientSlices by the indices name
+        name = str(param.indices)
+    else:
+        name = str(param)
+    return name[name.index(scope._NAMESCOPE_SEPARATOR) + 1:]
 
 
 def _AnalyzeOperators(model):
@@ -504,6 +551,9 @@ def _AnalyzeOperators(model):
     for op in model.Proto().op:
         if "NCCL" in op.type or "Copy" in op.type:
             continue
+        if "Allreduce" in op.type and "GLOO" in op.engine:
+            continue
+
         op_dev = op.device_option
         op_gpu = op_dev.cuda_gpu_id
 
@@ -520,25 +570,67 @@ def _AnalyzeOperators(model):
                     ))
 
 
-def _GroupByDevice(devices, params):
+def _InferBlobDevice(model):
+    '''
+    Assign blob to device option based on the operator outputing it
+    '''
+    mapping = {}
+
+    def map_ops(proto):
+        for op in proto.op:
+            for b in list(op.input) + list(op.output):
+                mapping[b] = op.device_option
+            if op.type.startswith('RecurrentNetwork'):
+                import google.protobuf.text_format as protobuftx
+                step_args = [a for a in op.arg if a.name.endswith("step_net")]
+                for step_arg in step_args:
+                    step_proto = caffe2_pb2.NetDef()
+                    protobuftx.Merge(step_arg.s, step_proto)
+                    map_ops(step_proto)
+    map_ops(model.net.Proto())
+
+    model._blob_to_device = mapping
+
+
+def _IsGPUBlob(model, blob_name):
+    if blob_name in model._blob_to_device:
+        return model._blob_to_device[blob_name].device_type == caffe2_pb2.CUDA
+    else:
+        blob_name = "gpu_{}/{}".format(model._devices[0], blob_name)
+        if blob_name not in model._blob_to_device:
+            return True
+        return model._blob_to_device[blob_name].device_type == caffe2_pb2.CUDA
+
+
+def _GroupByDevice(devices, params, non_data_params):
     '''
     Groups blobs by device, returning a map of [blobname] = {0: BlobRef, 1: ..}.
     Returns ordered dictionary, ensuring the original order.
     '''
     grouped = OrderedDict()
+    # Only consider params that were created to be  "data parallel"
+    params = params[len(non_data_params):]
     assert len(params) % len(devices) == 0,\
            "There should be equal number of params per device"
 
     num_params_per_device = int(len(params) / len(devices))
 
     for i, p in enumerate(params):
-        assert isinstance(p, core.BlobReference), \
-            "Param {} is not of type BlobReference".format(p)
+        assert isinstance(p, core.BlobReference) or \
+            isinstance(p, core.GradientSlice), \
+            "Param {} is not BlobReference or GradientSlice".format(p)
 
         name = stripParamName(p)
         gpuid = devices[i // num_params_per_device]
-        assert "gpu_{}/".format(gpuid) in p.GetNameScope(),\
-            "Param {} expected to have namescope 'gpu_{}'".format(str(p), gpuid)
+
+        if isinstance(p, core.BlobReference):
+            assert "gpu_{}/".format(gpuid) in p.GetNameScope(),\
+                "Param {} expected to have namescope 'gpu_{}'".format(str(p), gpuid)
+        else:
+            assert "gpu_{}/".format(gpuid) in p.indices.GetNameScope(),\
+                "Indices {} expected to have namescope 'gpu_{}'".format(str(p), gpuid)
+            assert "gpu_{}/".format(gpuid) in p.values.GetNameScope(),\
+                "Values {} expected to have namescope 'gpu_{}'".format(str(p), gpuid)
 
         if name not in grouped:
             grouped[name] = {}

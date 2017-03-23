@@ -19,14 +19,16 @@ class FC(ModelLayer):
                  **kwargs):
         super(FC, self).__init__(model, name, input_record, **kwargs)
         assert isinstance(input_record, schema.Scalar), "Incorrect input type"
-        assert len(input_record.field_types()[0].shape) > 0,\
-            "FC expects limited dimensions of the input tensor"
+        assert len(input_record.field_types()[0].shape) > 0, (
+            "FC expects limited dimensions of the input tensor")
 
         input_dims = input_record.field_types()[0].shape[0]
+        assert input_dims > 0, (
+            "FC expects input dimensions > 0, got {}".format(input_dims))
 
         self.output_schema = schema.Scalar(
-            (np.float32, output_dims),
-            core.ScopedBlobReference(model.net.NextName(self.name + '_output'))
+            (np.float32, (output_dims, )),
+            model.net.NextScopedBlob(name + '_output')
         )
 
         scale = math.sqrt(1.0 / input_dims)
@@ -35,8 +37,8 @@ class FC(ModelLayer):
         bias_init = bias_init if bias_init else (
             'UniformFill', {'min': -scale, 'max': scale})
 
-        self.w = core.ScopedBlobReference(model.net.NextName(self.name + "_w"))
-        self.b = core.ScopedBlobReference(model.net.NextName(self.name + "_b"))
+        self.w = model.net.NextScopedBlob(name + "_w")
+        self.b = model.net.NextScopedBlob(name + "_b")
 
         self.params.append(
             LayerParameter(

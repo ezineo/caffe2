@@ -7,14 +7,26 @@ import argparse
 import logging
 import numpy as np
 
-from caffe2.python import workspace, experiment_util, data_parallel_model
+from caffe2.python import core, workspace, experiment_util, data_parallel_model, dyndep
 from caffe2.python import timeout_guard, cnn
 
 import caffe2.python.models.resnet as resnet
 
 '''
-Parallelized multi-GPU trainer for Resnet 50. Can be used to train on imagenet
-data, for example.
+Parallelized multi-GPU distributed trainer for Resnet 50. Can be used to train
+on imagenet data, for example.
+
+To run the trainer in single-machine multi-gpu mode by setting num_shards = 1.
+
+To run the trainer in multi-machine multi-gpu mode with M machines,
+run the same program on all machines, specifying num_shards = M, and
+shard_id = a unique integer in the set [0, M-1].
+
+For rendezvous (the trainer processes have to know about each other),
+you can either use a directory path that is visible to all processes
+(e.g. NFS directory), or use a Redis instance. Use the former by
+passing the `file_store_path` argument. Use the latter by passing the
+`redis_host` and `redis_port` arguments.
 '''
 
 
@@ -22,6 +34,8 @@ logging.basicConfig()
 log = logging.getLogger("resnet50_trainer")
 log.setLevel(logging.DEBUG)
 
+dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:file_store_handler_ops')
+dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:redis_store_handler_ops')
 
 def AddImageInput(model, reader, batch_size, img_size):
     '''
@@ -106,7 +120,7 @@ def RunEpoch(
 
             if (test_model is not None):
                 # Run 5 iters of testing
-                for t in range(0, 5):
+                for _ in range(0, 5):
                     workspace.RunNet(test_model.net.Proto().name)
                     for g in test_model._devices:
                         test_accuracy += np.asscalar(workspace.FetchBlob(
@@ -136,15 +150,21 @@ def RunEpoch(
 
 def Train(args):
     total_batch_size = args.batch_size
-    num_gpus = args.num_gpus
-    batch_per_device = total_batch_size // num_gpus
 
+    # Either use specified device list or generate one
+    if args.gpus is not None:
+        gpus = [int(x) for x in args.gpus.split(',')]
+        num_gpus = len(gpus)
+    else:
+        gpus = range(args.num_gpus)
+        num_gpus = args.num_gpus
+
+    batch_per_device = total_batch_size // num_gpus
     assert \
         total_batch_size % num_gpus == 0, \
         "Number of GPUs must divide batch size"
 
-    gpus = range(num_gpus)
-    log.info("Running on gpus: {}".format(gpus))
+    log.info("Running on GPUs: {}".format(gpus))
 
     # Create CNNModeLhelper object
     train_model = cnn.CNNModelHelper(
@@ -153,6 +173,37 @@ def Train(args):
         use_cudnn=True,
         cudnn_exhaustive_search=True
     )
+
+    if args.num_shards > 1:
+        # Create rendezvous for distributed computation
+        store_handler = "store_handler"
+        if args.redis_host is not None:
+            # Use Redis for rendezvous if Redis host is specified
+            workspace.RunOperatorOnce(
+                core.CreateOperator(
+                    "RedisStoreHandlerCreate", [], [store_handler],
+                    host=args.redis_host,
+                    port=args.redis_port,
+                    prefix=args.run_id,
+                )
+            )
+        else:
+            # Use filesystem for rendezvous otherwise
+            workspace.RunOperatorOnce(
+                core.CreateOperator(
+                    "FileStoreHandlerCreate", [], [store_handler],
+                    path=args.file_store_path,
+                )
+            )
+        rendezvous = dict(
+            kv_handler=store_handler,
+            shard_id=args.shard_id,
+            num_shards=args.num_shards,
+            engine="GLOO",
+            exit_nets=None)
+    else:
+        rendezvous = None
+
 
     # Model building functions
     def create_resnet50_model_ops(model, loss_scale):
@@ -204,6 +255,7 @@ def Train(args):
         forward_pass_builder_fun=create_resnet50_model_ops,
         param_update_builder_fun=add_parameter_update_ops,
         devices=gpus,
+        rendezvous=rendezvous,
         optimize_gradient_memory=True,
     )
 
@@ -281,8 +333,10 @@ def main():
                         help="Path to test data")
     parser.add_argument("--db_type", type=str, default="lmdb",
                         help="Database type (such as lmdb or leveldb)")
+    parser.add_argument("--gpus", type=str,
+                        help="Comma separated list of GPU devices to use")
     parser.add_argument("--num_gpus", type=int, default=1,
-                        help="Number of GPUs.")
+                        help="Number of GPU devices (instead of --gpus)")
     parser.add_argument("--num_channels", type=int, default=3,
                         help="Number of color channels")
     parser.add_argument("--image_size", type=int, default=227,
@@ -290,7 +344,7 @@ def main():
     parser.add_argument("--num_labels", type=int, default=1000,
                         help="Number of labels")
     parser.add_argument("--batch_size", type=int, default=32,
-                        help="Batch size, total over all GPUs.")
+                        help="Batch size, total over all GPUs")
     parser.add_argument("--epoch_size", type=int, default=1500000,
                         help="Number of images/epoch")
     parser.add_argument("--num_epochs", type=int, default=1000,
@@ -299,6 +353,18 @@ def main():
                         help="Initial learning rate.")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help="Weight decay (L2 regularization)")
+    parser.add_argument("--num_shards", type=int, default=1,
+                        help="Number of machines in distributed run")
+    parser.add_argument("--shard_id", type=int, default=0,
+                        help="Shard id.")
+    parser.add_argument("--run_id", type=str,
+                        help="Unique run identifier (e.g. uuid)")
+    parser.add_argument("--redis_host", type=str,
+                        help="Host of Redis server (for rendezvous)")
+    parser.add_argument("--redis_port", type=int, default=6379,
+                        help="Port of Redis server (for rendezvous)")
+    parser.add_argument("--file_store_path", type=str, default="/tmp",
+                        help="Path to directory to use for rendezvous")
     args = parser.parse_args()
 
     Train(args)

@@ -1,5 +1,6 @@
 #include "caffe2/core/tensor.h"
 
+#include "caffe2/core/blob_stats.h"
 #include "caffe2/core/flags.h"
 
 CAFFE2_DEFINE_bool(
@@ -49,6 +50,22 @@ std::string TensorPrinter::MetaStr(const Tensor<CPUContext>& tensor) {
   return meta_stream.str();
 }
 
+static CaffeMap<CaffeTypeId, TypeCall> type_call_registry_ {
+  {TypeMeta::Id<Tensor<CPUContext>>(), GetTensorType<Tensor<CPUContext>>}
+};
+
+TypeCall GetTypeCallFunction(CaffeTypeId id) {
+  auto f = type_call_registry_.find(id);
+  if (f == type_call_registry_.end()) {
+    return nullptr;
+  }
+  return f->second;
+}
+
+void RegisterTypeCallFunction(CaffeTypeId id, TypeCall c) {
+  type_call_registry_[id] = c;
+}
+
 static CaffeMap<CaffeTypeId, ShapeCall> shape_call_registry_ {
   {TypeMeta::Id<Tensor<CPUContext>>(), GetTensorShape<Tensor<CPUContext>>}
 };
@@ -63,6 +80,24 @@ ShapeCall GetShapeCallFunction(CaffeTypeId id) {
 
 void RegisterShapeCallFunction(CaffeTypeId id, ShapeCall c) {
   shape_call_registry_[id] = c;
+}
+
+namespace {
+
+struct TensorCPUStatGetter : BlobStatGetter {
+  size_t sizeBytes(const Blob& blob) const override {
+    const auto& tensor = blob.Get<TensorCPU>();
+    auto nbytes = tensor.nbytes();
+    if (nbytes > 0 && tensor.IsType<std::string>()) {
+      const auto* data = tensor.data<std::string>();
+      for (size_t i = 0; i < tensor.size(); ++i) {
+        nbytes += data[i].size();
+      }
+    }
+    return nbytes;
+  }
+};
+REGISTER_BLOB_STAT_GETTER(TensorCPU, TensorCPUStatGetter);
 }
 
 } // namespace caffe2

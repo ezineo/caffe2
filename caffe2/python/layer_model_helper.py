@@ -48,17 +48,25 @@ class LayerModelHelper(model_helper.ModelHelperBase):
             self.net,
             trainer_extra_schema
         )
+        self._metrics_schema = schema.Struct()
 
         self._init_global_constants()
         self.param_init_net = self.create_init_net('param_init_net')
+
+    def add_metric_field(self, name, value):
+        assert name not in self._metrics_schema.fields, (
+            "Try to add metric field twice: {}".format(name))
+        self._metrics_schema = self._metrics_schema + schema.Struct(
+            (name, value)
+        )
 
     def add_global_constant(self, name, array=None, dtype=None,
                             initializer=None):
         # This is global namescope for constants. They will be created in all
         # init_nets and there should be very few of them.
         assert name not in self.global_constants
-        self.global_constants[name] = core.BlobReference(
-            self.net.NextName(name))
+        self.global_constants[name] = self.net.NextBlob(name)
+
         if array is not None:
             assert initializer is None,\
                 "Only one from array and initializer should be specified"
@@ -109,14 +117,20 @@ class LayerModelHelper(model_helper.ModelHelperBase):
         return init_net
 
     def next_layer_name(self, prefix):
-        name = prefix + "_{}".format(
-            len(filter(lambda x: x.startswith(prefix), self._layer_names)))
+        base_name = core.ScopedName(prefix)
+        name = base_name
+        index = 0
+        while name in self._layer_names:
+            name = base_name + '_auto_' + str(index)
+            index += 1
+
         self._layer_names.add(name)
         return name
 
     def add_layer(self, layer):
         self._layers.append(layer)
         for param in layer.get_parameters():
+            assert isinstance(param.parameter, core.BlobReference)
             self.param_to_optim[str(param.parameter)] = param.optimizer
 
         # The primary value of adding everything to self.net - generation of the
@@ -124,6 +138,14 @@ class LayerModelHelper(model_helper.ModelHelperBase):
         # immediately. Other then this - create_x_net should be called.
         layer.add_operators(self.net, self.param_init_net)
         return layer.get_output_schema()
+
+    def get_parameter_blobs(self):
+        param_blobs = []
+        for layer in self._layers:
+            for param in layer.get_parameters():
+                param_blobs.append(param.parameter)
+
+        return param_blobs
 
     @property
     def default_optimizer(self):
@@ -140,6 +162,17 @@ class LayerModelHelper(model_helper.ModelHelperBase):
     @property
     def trainer_extra_schema(self):
         return self._trainer_extra_schema
+
+    @property
+    def metrics_schema(self):
+        """
+        Returns the schema that represents model output that should be used for
+        metric reporting.
+
+        During the training/evaluation this schema will be appended to the
+        schema that represents model output.
+        """
+        return self._metrics_schema
 
     @property
     def output_schema(self):
@@ -162,14 +195,30 @@ class LayerModelHelper(model_helper.ModelHelperBase):
         self._loss = loss
 
     def __getattr__(self, layer):
-        if not layers.layer_exists(layer):
+        # TODO(amalevich): Add add support for ifbpy inline documentation
+        if layers.layer_exists(layer):
+            def wrapper(*args, **kwargs):
+                return self.add_layer(
+                    layers.create_layer(layer, self, *args, **kwargs))
+            return wrapper
+        elif core.IsOperator(layer):
+            def wrapper(*args, **kwargs):
+                def apply_operator(net, in_record, out_record):
+                    # TODO(amalevich): Switch to net.operator as soon as it gets
+                    # landed
+                    net.__getattr__(layer)(in_record.field_blobs(),
+                                           out_record.field_blobs(),
+                                           **kwargs)
+                if 'name' not in kwargs:
+                    kwargs['name'] = layer
+                return self.add_layer(
+                    layers.create_layer('Functional',
+                                        self, *args, function=apply_operator,
+                                        **kwargs))
+            return wrapper
+        else:
             raise ValueError(
                 "Tring to create non-registered layer: {0}".format(layer))
-
-        def wrapper(*args, **kwargs):
-            return self.add_layer(
-                layers.create_layer(layer, self, *args, **kwargs))
-        return wrapper
 
     @property
     def layers(self):

@@ -26,43 +26,6 @@ enum class CudaMemoryPoolType {
  */
 CudaMemoryPoolType GetCudaMemoryPoolType();
 
-/**
- * An allocator that does the CPU memory allocation with pinned memory.
- *
- * This is needed because if we want to do any asynchronous cuda memcpy,
- * the underlying CPU memory also needs to be allocated into pinned memory
- * space. As a result, whenever Caffe2 is built with GPU and there is
- * GPU present during runtime, at global initialization time we will set
- * the CPU memory allocator to allocate pinned memory.
- */
-struct PinnedCPUAllocator final : CPUAllocator {
-  PinnedCPUAllocator() {}
-  ~PinnedCPUAllocator() {}
-  void* New(size_t nbytes) override {
-    void* data;
-    CUDA_CHECK(cudaMallocHost(&data, nbytes));
-    memset(data, 0, nbytes);
-    return data;
-  }
-  void Delete(void* data) override {
-    // Caffe2 uses a lazy way to figure out if one is actually going to use GPUs
-    // or not. If a CUDAContext::New() call is made, inside the CUDAContext
-    // function we will switch the cpu side allocator to a PinnedCPUAllocator.
-    // But, if one calls CPUContext::New() before any cuda allocations,
-    // PinnedCPUAllocator can still delete the corresponding memory.
-    cudaError_t err = cudaFreeHost(data);
-    if (err == cudaErrorInvalidValue) {
-      free(data);
-      // Calling cudaGetLastError will reset the cuda error.
-      cudaGetLastError();
-    } else {
-      // For all other errors, still do a cuda check.
-      CUDA_CHECK(err);
-    }
-  }
-};
-
-class CUDAContext;
 
 /**
  * A struct to host thread-local cuda objects.
@@ -86,45 +49,45 @@ class ThreadLocalCUDAObjects {
   cudaStream_t GetStream(int gpu, int stream_id) {
     vector<cudaStream_t> &gpu_streams = cuda_streams_[gpu];
     if (gpu_streams.size() <= stream_id) {
-      gpu_streams.resize(stream_id + 1);
+      gpu_streams.resize(stream_id + 1, nullptr);
     }
     if (!gpu_streams[stream_id]) {
       DeviceGuard guard(gpu);
-      CUDA_CHECK(cudaStreamCreateWithFlags(
-        &gpu_streams[stream_id], cudaStreamNonBlocking
-      ));
+      CUDA_ENFORCE(cudaStreamCreateWithFlags(
+          &gpu_streams[stream_id], cudaStreamNonBlocking));
     }
     return gpu_streams[stream_id];
   }
 
   cublasHandle_t GetHandle(int gpu, int stream_id) {
+    DeviceGuard guard(gpu);
     vector<cublasHandle_t> &gpu_handles = cublas_handles_[gpu];
     if (gpu_handles.size() <= stream_id) {
-      gpu_handles.resize(stream_id + 1);
+      gpu_handles.resize(stream_id + 1, nullptr);
     }
     if (!gpu_handles[stream_id]) {
-      CUBLAS_CHECK(cublasCreate(&gpu_handles[stream_id]));
+      CUBLAS_ENFORCE(cublasCreate(&gpu_handles[stream_id]));
       // The default is CUBLAS_POINTER_MODE_HOST. You can override
       // it after obtaining the cublas handle, but do that with
       // caution.
-      CUBLAS_CHECK(cublasSetPointerMode(
+      CUBLAS_ENFORCE(cublasSetPointerMode(
           gpu_handles[stream_id], CUBLAS_POINTER_MODE_HOST));
-      CUBLAS_CHECK(cublasSetStream(gpu_handles[stream_id],
-          GetStream(gpu, stream_id)));
+      CUBLAS_ENFORCE(
+          cublasSetStream(gpu_handles[stream_id], GetStream(gpu, stream_id)));
     }
     return gpu_handles[stream_id];
   }
 
-  ~ThreadLocalCUDAObjects() {
+  ~ThreadLocalCUDAObjects() noexcept {
     for (int i = 0; i < CAFFE2_COMPILE_TIME_MAX_GPUS; ++i) {
-      for (auto handle : cublas_handles_[i]) {
+      for (auto& handle : cublas_handles_[i]) {
         if (handle) {
-          cublasDestroy(handle);
+          CUBLAS_CHECK(cublasDestroy(handle));
         }
       }
-      for (auto stream: cuda_streams_[i]) {
+      for (auto& stream : cuda_streams_[i]) {
         if (stream) {
-          cudaStreamDestroy(stream);
+          CUDA_CHECK(cudaStreamDestroy(stream));
         }
       }
     }
@@ -141,13 +104,17 @@ class CUDAContext final {
 
   ~CUDAContext() {
     if (curand_generator_) {
-      CURAND_CHECK(curandDestroyGenerator(curand_generator_));
+      CURAND_ENFORCE(curandDestroyGenerator(curand_generator_));
     }
     CAFFE_ENFORCE(FinishDeviceComputation());
   }
 
+  inline void SwitchToDevice(int stream_id) {
+    set_stream_id(stream_id);
+    CUDA_ENFORCE(cudaSetDevice(gpu_id_));
+  }
   inline void SwitchToDevice() {
-    CUDA_CHECK(cudaSetDevice(gpu_id_));
+    SwitchToDevice(0);
   }
 
   bool FinishDeviceComputation() {
@@ -168,7 +135,7 @@ class CUDAContext final {
     return cuda_stream(gpu_id_, stream_id_);
   }
 
-  inline const cudaStream_t cuda_stream() const {
+  inline cudaStream_t cuda_stream() const {
     return cuda_stream(gpu_id_, stream_id_);
   }
 
@@ -183,13 +150,13 @@ class CUDAContext final {
   curandGenerator_t& curand_generator() {
     if (!curand_generator_) {
       DeviceGuard guard(gpu_id_);
-      CURAND_CHECK(
+      CURAND_ENFORCE(
           curandCreateGenerator(&curand_generator_, CURAND_RNG_PSEUDO_DEFAULT));
-      CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(
-          curand_generator_, random_seed_));
+      CURAND_ENFORCE(
+          curandSetPseudoRandomGeneratorSeed(curand_generator_, random_seed_));
       CHECK_NOTNULL(curand_generator_);
     }
-    CURAND_CHECK(curandSetStream(curand_generator_, cuda_stream()));
+    CURAND_ENFORCE(curandSetStream(curand_generator_, cuda_stream()));
     return curand_generator_;
   }
 
@@ -205,8 +172,11 @@ class CUDAContext final {
 
   template <class SrcContext, class DstContext>
   inline void CopyBytes(size_t nbytes, const void* src, void* dst) {
-    CUDA_CHECK(cudaMemcpyAsync(
-        dst, src, nbytes, cudaMemcpyDefault,
+    CUDA_ENFORCE(cudaMemcpyAsync(
+        dst,
+        src,
+        nbytes,
+        cudaMemcpyDefault,
         cuda_objects_.GetStream(gpu_id_, stream_id_)));
   }
 
@@ -253,6 +223,44 @@ inline void CPUContext::CopyBytes<CPUContext, CUDAContext>(
   CUDAContext context(GetGPUIDForPointer(dst));
   context.CopyBytes<CPUContext, CUDAContext>(nbytes, src, dst);
 }
+
+/**
+ * An allocator that does the CPU memory allocation with pinned memory.
+ *
+ * This is needed because if we want to do any asynchronous cuda memcpy,
+ * the underlying CPU memory also needs to be allocated into pinned memory
+ * space. As a result, whenever Caffe2 is built with GPU and there is
+ * GPU present during runtime, at global initialization time we will set
+ * the CPU memory allocator to allocate pinned memory.
+ */
+struct PinnedCPUAllocator final : CPUAllocator {
+  PinnedCPUAllocator() {}
+  ~PinnedCPUAllocator() {}
+  void* New(size_t nbytes) override {
+    void* data;
+    std::lock_guard<std::mutex> lock(CUDAContext::mutex());
+    CUDA_ENFORCE(cudaMallocHost(&data, nbytes));
+    memset(data, 0, nbytes);
+    return data;
+  }
+  void Delete(void* data) override {
+    // Caffe2 uses a lazy way to figure out if one is actually going to use GPUs
+    // or not. If a CUDAContext::New() call is made, inside the CUDAContext
+    // function we will switch the cpu side allocator to a PinnedCPUAllocator.
+    // But, if one calls CPUContext::New() before any cuda allocations,
+    // PinnedCPUAllocator can still delete the corresponding memory.
+    std::lock_guard<std::mutex> lock(CUDAContext::mutex());
+    cudaError_t err = cudaFreeHost(data);
+    if (err == cudaErrorInvalidValue) {
+      free(data);
+      // Calling cudaGetLastError will reset the cuda error.
+      cudaGetLastError();
+    } else {
+      // For all other errors, still do a cuda check.
+      CUDA_ENFORCE(err);
+    }
+  }
+};
 
 // For simplicity, we will typedef Tensor<CPUContext> to TensorCPU.
 typedef Tensor<CUDAContext> TensorCUDA;

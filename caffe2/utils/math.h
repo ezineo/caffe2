@@ -15,8 +15,11 @@ extern "C" {
 
 #include "caffe2/core/common.h"
 #include "caffe2/core/types.h"
+
+#ifndef __CUDACC__
 #include "Eigen/Core"
 #include "Eigen/Dense"
+#endif
 
 namespace caffe2 {
 
@@ -24,6 +27,7 @@ namespace caffe2 {
 // engine specified.
 class DefaultEngine {};
 
+#ifndef __CUDACC__
 // Common Eigen types that we will often use
 template <typename T>
 using EigenMatrixMap =
@@ -47,6 +51,7 @@ using ConstEigenVectorMap =
 template <typename T>
 using ConstEigenVectorArrayMap =
     Eigen::Map<const Eigen::Array<T, Eigen::Dynamic, 1> >;
+#endif
 
 namespace math {
 
@@ -166,8 +171,22 @@ void RandUniform(const int n, const T a, const T b, T* r,
                  Context* context);
 
 template <typename T, class Context>
-void RandGaussian(const int n, const T mean, const T std, T* r,
-                  Context* context);
+void RandUniformUnique(
+    const size_t n,
+    const T a,
+    const T b,
+    T* r,
+    const size_t m,
+    const T* avoid,
+    Context* context);
+
+template <typename T, class Context>
+void RandGaussian(
+    const int n,
+    const T mean,
+    const T std,
+    T* r,
+    Context* context);
 
 // Dot matrix of vector a and b, and writes the result to a single value y.
 template <typename T, class Context>
@@ -183,11 +202,8 @@ template <typename T, class Context>
 void Select(const int N, const int D, const T* x, const int* idx, T* y,
             Context* context);
 
-// For small FixedValues (like FixedSize=1) the function might provide more
-// efficent implementation hard-coded statically for this size.
-template <typename T, class Context, int FixedSize = -1>
-void Scale(const int N, const T alpha, const T* x, T* y,
-           Context* context);
+template <typename T, class Context>
+void Scale(const int N, const T alpha, const T* x, T* y, Context* context);
 
 // Different from the Scale function above, if alpha is passed in
 // as a pointer, we will assume that it lives on the Context device,
@@ -196,9 +212,7 @@ template <typename T, class Context>
 void Scale(const int N, const T* alpha, const T* x, T* y,
            Context* context);
 
-// For small FixedValues (like FixedSize=1) the function might provide more
-// efficent implementation hard-coded statically for this size.
-template <typename T, class Context, int FixedSize = -1>
+template <typename T, class Context>
 void Axpy(const int N, const T alpha, const T* x, T* y, Context* context);
 
 // Different from the Axpy function above, if alpha is passed in
@@ -211,6 +225,37 @@ void Axpy(const int N, const T* alpha, const T* x, T* y,
 template <typename T, class Context>
 void Axpby(const int N, const T alpha, const T* x, const T b, T* y,
            Context* context);
+
+template <typename T, class Context, int order>
+void Im2colNd(
+    const T* data_img,
+    const int* im_shape,
+    const int* col_shape,
+    const int img_size,
+    const int col_size,
+    const int* kernel_shape,
+    const int* stride,
+    const int* dilation,
+    const int* pad,
+    const int N,
+    T* data_col,
+    Context* context,
+    bool accumulate_output = false);
+
+template <typename T, class Context, int order>
+void Col2imNd(
+    const T* data_col,
+    const int* img_shape,
+    const int* col_shape,
+    const int img_size,
+    const int col_size,
+    const int* kernel_shape,
+    const int* stride,
+    const int* dilation,
+    const int* pad,
+    const int N,
+    T* data_img,
+    Context* context);
 
 template <typename T, class Context, int order>
 void Im2col(

@@ -2,11 +2,15 @@
 #include <atomic>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 
 #include "cub/util_allocator.cuh"
+#ifdef CAFFE2_USE_CNMEM
 #include "cnmem.h"
+#endif // CAFFE2_USE_CNMEM
 
 #include "caffe2/core/asan.h"
+#include "caffe2/core/common_cudnn.h"
 #include "caffe2/core/context_gpu.h"
 #include "caffe2/core/init.h"
 #include "caffe2/core/logging.h"
@@ -54,10 +58,25 @@ thread_local ThreadLocalCUDAObjects CUDAContext::cuda_objects_;
 
 // Static global variables for setting up the memory pool.
 CudaMemoryPoolType g_cuda_memory_pool_type;
+#ifdef CAFFE2_USE_CNMEM
 // For cnmem allocator
 vector<bool> g_cnmem_available_for_device;
+#endif // CAFFE2_USE_CNMEM
 // For cub allocator
 unique_ptr<cub::CachingDeviceAllocator> g_cub_allocator;
+// an unordered map that holds the map from the cuda memory pointer to the
+// device id that it is allocated from. This is used in the cuda memory pool
+// cases, where we need the device id to carry out the deletion.
+// Note(jiayq): an alternate approach is to use cudaGetPointerAttributes, but
+// that is usually quite slow. We might want to benchmark the speed difference
+// though.
+// Note(jiayq): another alternate approach is to augment the Tensor class that
+// would allow one to record the device id. However, this does not address any
+// non-tensor allocation and deallocation.
+// Ideally, a memory pool should already have the device id information, as
+// long as we are using UVA (as of CUDA 5 and later) so the addresses are
+// unique.
+static std::unordered_map<void*, uint8_t> g_cuda_device_affiliation;
 
 CudaMemoryPoolType GetCudaMemoryPoolType() {
   return g_cuda_memory_pool_type;
@@ -90,7 +109,7 @@ static void Caffe2InitializeCuda() {
   // Save the current device so we can restore it after moving across
   // different devices.
   int init_device;
-  CUDA_CHECK(cudaGetDevice(&init_device));
+  CUDA_ENFORCE(cudaGetDevice(&init_device));
 
   for (int i = 0; i < NumCudaDevices(); ++i) {
     auto err = cudaSetDevice(i);
@@ -104,25 +123,34 @@ static void Caffe2InitializeCuda() {
     for (int j = 0; j < NumCudaDevices(); ++j) {
       if (i == j) continue;
       int can_access;
-      CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, i, j));
+      CUDA_ENFORCE(cudaDeviceCanAccessPeer(&can_access, i, j));
       if (can_access) {
         VLOG(1) << "Enabling peer access from " << i << " to " << j;
         // Note: just for future reference, the 0 here is not a gpu id, it is
         // a reserved flag for cudaDeviceEnablePeerAccess that should always be
         // zero currently.
-        CUDA_CHECK(cudaDeviceEnablePeerAccess(j, 0));
+        CUDA_ENFORCE(cudaDeviceEnablePeerAccess(j, 0));
       }
     }
   }
   // Restore the current device.
-  CUDA_CHECK(cudaSetDevice(init_device));
-  
+  CUDA_ENFORCE(cudaSetDevice(init_device));
+
+  RegisterTypeCallFunction(
+    TypeMeta::Id<Tensor<CUDAContext>>(),
+    GetTensorType<CUDAContext>
+  );
+
   RegisterShapeCallFunction(
     TypeMeta::Id<Tensor<CUDAContext>>(),
     GetTensorShape<CUDAContext>
   );
+
+  // Check the versions of cuDNN that were compiled and linked with are compatible
+  CheckCuDNNVersions();
 }
 
+#ifdef CAFFE2_USE_CNMEM
 static void SetUpCNMEM() {
   g_cnmem_available_for_device.assign(NumCudaDevices(), false);
   VLOG(1) << "Setting up cnmem memory pool.";
@@ -159,7 +187,7 @@ static void SetUpCNMEM() {
         "GPU id ", id, " out of the range of available GPUs.");
     DeviceGuard guard(id);
     size_t free, used;
-    CUDA_CHECK(cudaMemGetInfo(&free, &used));
+    CUDA_ENFORCE(cudaMemGetInfo(&free, &used));
     VLOG(1) << "Reserving " << FLAGS_caffe2_cnmem_reserve * 100
             << " percent of the free memory (total " << free
             << ") on device " << id;
@@ -177,6 +205,7 @@ static void SetUpCNMEM() {
       cnmemInit(cnmem_devs.size(), cnmem_devs.data(), CNMEM_FLAGS_DEFAULT));
   VLOG(1) << "Done setting up cnmem memory pool.";
 }
+#endif // CAFFE2_USE_CNMEM
 
 static void SetUpCub() {
   VLOG(1) << "Setting up cub memory pool.";
@@ -206,9 +235,14 @@ static void Caffe2SetCUDAMemoryPool() {
       FLAGS_caffe2_cuda_memory_pool == "none") {
     g_cuda_memory_pool_type = CudaMemoryPoolType::NONE;
   } else if (FLAGS_caffe2_cuda_memory_pool == "cnmem") {
+#ifdef CAFFE2_USE_CNMEM
     // sets up cnmem.
     g_cuda_memory_pool_type = CudaMemoryPoolType::CNMEM;
     SetUpCNMEM();
+#else
+    CAFFE_THROW("This caffe2 is not built with cnmem support, so you should "
+                "not use the cnmem memory pool type.");
+#endif // CAFFE2_USE_CNMEM
   } else if (FLAGS_caffe2_cuda_memory_pool == "cub") {
     // Sets up cub.
     g_cuda_memory_pool_type = CudaMemoryPoolType::CUB;
@@ -233,6 +267,7 @@ void Caffe2UsePinnedCPUAllocator() {
 #else
   if (!HasCudaGPU()) {
     VLOG(1) << "No GPU present. I won't use pinned allocator then.";
+    return;
   }
   VLOG(1) << "Caffe2 gpu: setting CPUAllocator to PinnedCPUAllocator.";
   SetCPUAllocator(new PinnedCPUAllocator());
@@ -287,9 +322,10 @@ void* CUDAContext::New(size_t nbytes) {
   void* ptr = nullptr;
   switch (g_cuda_memory_pool_type) {
   case CudaMemoryPoolType::NONE:
-    CUDA_CHECK(cudaMalloc(&ptr, nbytes));
+    CUDA_ENFORCE(cudaMalloc(&ptr, nbytes));
     return ptr;
   case CudaMemoryPoolType::CNMEM: {
+#ifdef CAFFE2_USE_CNMEM
     auto gpuId = GetCurrentGPUID();
     CAFFE_ENFORCE(
         gpuId < g_cnmem_available_for_device.size() &&
@@ -298,10 +334,20 @@ void* CUDAContext::New(size_t nbytes) {
         gpuId,
         " but cnmem pool is not set up for it.");
     CNMEM_CHECK(cnmemMalloc(&ptr, nbytes, nullptr));
+    g_cuda_device_affiliation[ptr] = GetCurrentGPUID();
+    VLOG(2) << "CNMEM allocating pointer " << ptr << " on device "
+            << GetCurrentGPUID();
     return ptr;
+#else
+    CAFFE_THROW("This caffe2 is not built with cnmem support, so you should "
+                "not use the cnmem memory pool type.");
+#endif // CAFFE2_USE_CNMEM
   }
   case CudaMemoryPoolType::CUB:
-    CUDA_CHECK(g_cub_allocator->DeviceAllocate(&ptr, nbytes));
+    CUDA_ENFORCE(g_cub_allocator->DeviceAllocate(&ptr, nbytes));
+    g_cuda_device_affiliation[ptr] = GetCurrentGPUID();
+    VLOG(2) << "CUB allocating pointer " << ptr << " on device "
+            << GetCurrentGPUID();
     return ptr;
   }
   return nullptr;
@@ -324,14 +370,30 @@ void CUDAContext::Delete(void* ptr) {
     if (error != cudaSuccess && error != cudaErrorCudartUnloading) {
       LOG(FATAL) << "Error at: " << __FILE__ << ":" << __LINE__ << ": "
                  << cudaGetErrorString(error);
-		}
+    }
     break; }
-  case CudaMemoryPoolType::CNMEM:
-  	CNMEM_CHECK(cnmemFree(ptr, nullptr));
+  case CudaMemoryPoolType::CNMEM: {
+#ifdef CAFFE2_USE_CNMEM
+    auto it = g_cuda_device_affiliation.find(ptr);
+    DCHECK(it != g_cuda_device_affiliation.end());
+    DeviceGuard guard(it->second);
+    VLOG(2) << "CNMEM freeing pointer " << ptr << " on device " << it->second;
+    CNMEM_CHECK(cnmemFree(ptr, nullptr));
+    g_cuda_device_affiliation.erase(it);
     break;
-  case CudaMemoryPoolType::CUB:
-    CUDA_CHECK(g_cub_allocator->DeviceFree(ptr));
+#else
+    CAFFE_THROW("This caffe2 is not built with cnmem support, so you should "
+                "not use the cnmem memory pool type.");
+#endif // CAFFE2_USE_CNMEM
+  }
+  case CudaMemoryPoolType::CUB: {
+    auto it = g_cuda_device_affiliation.find(ptr);
+    DCHECK(it != g_cuda_device_affiliation.end());
+    VLOG(2) << "CUB freeing pointer " << ptr << " on device " << it->second;
+    CUDA_ENFORCE(g_cub_allocator->DeviceFree(it->second, ptr));
+    g_cuda_device_affiliation.erase(it);
     break;
+  }
   }
 }
 

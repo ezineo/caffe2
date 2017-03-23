@@ -29,7 +29,7 @@ class Workspace;
 class NetBase {
  public:
   NetBase(const NetDef& net_def, Workspace* ws);
-  virtual ~NetBase() {}
+  virtual ~NetBase() noexcept {}
   virtual bool Run() = 0;
 
   // RunAsync runs the net on the current stream, but potentially does
@@ -80,7 +80,7 @@ unique_ptr<NetBase> CreateNet(const NetDef& net_def, Workspace* ws);
 // This is the very basic structure you need to run a network - all it
 // does is simply to run everything in sequence. If you want more fancy control
 // such as a DAG-like execution, check out other better net implementations.
-class SimpleNet final : public NetBase {
+class SimpleNet : public NetBase {
  public:
   SimpleNet(const NetDef& net_def, Workspace* ws);
   bool Run() override;
@@ -102,6 +102,7 @@ struct OperatorNode {
   vector<int> children_;
   vector<int> parents_;
   std::atomic<int> runtime_parent_count_;
+  bool is_chain_start_ = false;
 };
 
 struct OpGraphNode {
@@ -109,7 +110,6 @@ struct OpGraphNode {
   vector<int> parents_;
   int visited_inputs = 0;
   int num_orig_parents;
-  bool visited = false;
 };
 }
 
@@ -135,6 +135,7 @@ class DAGNetBase : public NetBase {
 
  protected:
   virtual bool RunAt(const std::vector<int>& chain) = 0;
+
   vector<internal::OperatorNode> operator_nodes_;
   ExecutionChains execution_chains_;
   vector<int> initial_frontier_;

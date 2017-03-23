@@ -61,7 +61,7 @@ import argparse
 from caffe2.python import cnn, workspace
 
 
-def MLP(order):
+def MLP(order, cudnn_ws):
     model = cnn.CNNModelHelper()
     d = 256
     depth = 20
@@ -85,10 +85,11 @@ def MLP(order):
     return model, d
 
 
-def AlexNet(order):
+def AlexNet(order, cudnn_ws):
     model = cnn.CNNModelHelper(
         order, name="alexnet",
-        use_cudnn=True, cudnn_exhaustive_search=True)
+        use_cudnn=True, cudnn_exhaustive_search=True,
+        ws_nbytes_limit=cudnn_ws)
     conv1 = model.Conv(
         "data",
         "conv1",
@@ -166,10 +167,11 @@ def AlexNet(order):
     return model, 224
 
 
-def OverFeat(order):
+def OverFeat(order, cudnn_ws):
     model = cnn.CNNModelHelper(
         order, name="overfeat",
-        use_cudnn=True, cudnn_exhaustive_search=True)
+        use_cudnn=True, cudnn_exhaustive_search=True,
+        ws_nbytes_limit=cudnn_ws)
     conv1 = model.Conv(
         "data",
         "conv1",
@@ -239,10 +241,11 @@ def OverFeat(order):
     return model, 231
 
 
-def VGGA(order):
+def VGGA(order, cudnn_ws):
     model = cnn.CNNModelHelper(
         order, name='vgg-a',
-        use_cudnn=True, cudnn_exhaustive_search=True)
+        use_cudnn=True, cudnn_exhaustive_search=True,
+        ws_nbytes_limit=cudnn_ws)
     conv1 = model.Conv(
         "data",
         "conv1",
@@ -416,10 +419,11 @@ def _InceptionModule(
     return output
 
 
-def Inception(order):
+def Inception(order, cudnn_ws):
     model = cnn.CNNModelHelper(
         order, name="inception",
-        use_cudnn=True, cudnn_exhaustive_search=True)
+        use_cudnn=True, cudnn_exhaustive_search=True,
+        ws_nbytes_limit=cudnn_ws)
     conv1 = model.Conv(
         "data",
         "conv1",
@@ -504,7 +508,7 @@ def AddParameterUpdate(model):
 
 
 def Benchmark(model_gen, arg):
-    model, input_size = model_gen(arg.order)
+    model, input_size = model_gen(arg.order, arg.cudnn_ws)
     model.Proto().type = arg.net_type
     model.Proto().num_workers = arg.num_workers
 
@@ -587,7 +591,6 @@ def GetArgumentParser():
     parser.add_argument(
         "--cudnn_ws",
         type=int,
-        default=-1,
         help="The cudnn workspace size."
     )
     parser.add_argument(
@@ -637,22 +640,21 @@ def GetArgumentParser():
 if __name__ == '__main__':
     args = GetArgumentParser().parse_args()
     if (
-        not args.batch_size or not args.model or not args.order or
-        not args.cudnn_ws
+        not args.batch_size or not args.model or not args.order
     ):
         GetArgumentParser().print_help()
+    else:
+        workspace.GlobalInit(
+            ['caffe2', '--caffe2_log_level=0'] +
+            (['--caffe2_use_nvtx'] if args.use_nvtx else []) +
+            (['--caffe2_htrace_span_log_path=' + args.htrace_span_log_path]
+                if args.htrace_span_log_path else []))
 
-    workspace.GlobalInit(
-        ['caffe2', '--caffe2_log_level=0'] +
-        (['--caffe2_use_nvtx'] if args.use_nvtx else []) +
-        (['--caffe2_htrace_span_log_path=' + args.htrace_span_log_path]
-            if args.htrace_span_log_path else []))
-
-    model_map = {
-        'AlexNet': AlexNet,
-        'OverFeat': OverFeat,
-        'VGGA': VGGA,
-        'Inception': Inception,
-        'MLP': MLP,
-    }
-    Benchmark(model_map[args.model], args)
+        model_map = {
+            'AlexNet': AlexNet,
+            'OverFeat': OverFeat,
+            'VGGA': VGGA,
+            'Inception': Inception,
+            'MLP': MLP,
+        }
+        Benchmark(model_map[args.model], args)

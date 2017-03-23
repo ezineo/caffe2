@@ -1,4 +1,4 @@
-// Implementes the math functions for CPU.
+// Implements the math functions for CPU.
 // The implementation in this file allows us to route the underlying numerical
 // computation library to different backends. Notably:
 // (1) For all BLAS-related functions, one can explicitly request a BLAS backend
@@ -11,10 +11,10 @@
 //     platforms, it allows one to quickly port Caffe2 to different platforms
 //     where BLAS may not be present.
 
-#include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <random>
+#include <unordered_set>
 
 #ifdef CAFFE2_USE_MKL
 #include <mkl.h>
@@ -25,6 +25,10 @@
 #include "caffe2/core/context.h"
 #include "Eigen/Core"
 #include "Eigen/Dense"
+
+#if defined(_MSC_VER)
+#include <process.h>
+#endif
 
 namespace caffe2 {
 namespace math {
@@ -202,16 +206,10 @@ void Gemv<float, CPUContext>(
 }
 
 #define CAFFE2_SPECIALIZED_SCALE(T)                                         \
-  namespace detail {                                                        \
   template <>                                                               \
-  void ScaleDynamic<T, CPUContext>(                                         \
-      const int n,                                                          \
-      const T alpha,                                                        \
-      const T* x,                                                           \
-      T* y,                                                                 \
-      CPUContext* context) {                                                \
+  void Scale<T, CPUContext>(                                                \
+      const int n, const T alpha, const T* x, T* y, CPUContext* context) {  \
     EigenVectorMap<T>(y, n) = ConstEigenVectorMap<T>(x, n) * alpha;         \
-  }                                                                         \
   }                                                                         \
   template <>                                                               \
   void Scale<T, CPUContext>(                                                \
@@ -234,16 +232,10 @@ CAFFE2_SPECIALIZED_DOT(double)
 #undef CAFFE2_SPECIALIZED_DOT
 
 #define CAFFE2_SPECIALIZED_AXPY(T)                                          \
-  namespace detail {                                                        \
   template <>                                                               \
-  void AxpyDynamic<T, CPUContext>(                                          \
-      const int N,                                                          \
-      const T alpha,                                                        \
-      const T* x,                                                           \
-      T* Y,                                                                 \
-      CPUContext* context) {                                                \
+  void Axpy<T, CPUContext>(                                                 \
+      const int N, const T alpha, const T* x, T* Y, CPUContext* context) {  \
     EigenVectorMap<T>(Y, N) += ConstEigenVectorMap<T>(x, N) * alpha;        \
-  }                                                                         \
   }                                                                         \
   template <>                                                               \
   void Axpy<T, CPUContext>(                                                 \
@@ -307,18 +299,12 @@ void Gemv<float, CPUContext>(
 }
 
 #define CAFFE2_SPECIALIZED_SCALE(T, prefix)                                 \
-  namespace detail {                                                       \
   template <>                                                               \
-  void ScaleDynamic<T, CPUContext>(                                         \
-      const int n,                                                          \
-      const T alpha,                                                        \
-      const T* x,                                                           \
-      T* y,                                                                 \
-      CPUContext* context) {                                                \
+  void Scale<T, CPUContext>(                                                \
+      const int n, const T alpha, const T* x, T* y, CPUContext* context) {  \
     if (y != x)                                                             \
       cblas_##prefix##copy(n, x, 1, y, 1);                                  \
     cblas_##prefix##scal(n, alpha, y, 1);                                   \
-  }                                                                         \
   }                                                                         \
   template <>                                                               \
   void Scale<T, CPUContext>(                                                \
@@ -343,16 +329,10 @@ CAFFE2_SPECIALIZED_DOT(double, d)
 #undef CAFFE2_SPECIALIZED_DOT
 
 #define CAFFE2_SPECIALIZED_AXPY(T, prefix)                                  \
-  namespace detail {                                                        \
   template <>                                                               \
-  void AxpyDynamic<T, CPUContext>(                                          \
-      const int N,                                                          \
-      const T alpha,                                                        \
-      const T* x,                                                           \
-      T* y,                                                                 \
-      CPUContext* context) {                                                \
+  void Axpy<T, CPUContext>(                                                 \
+      const int N, const T alpha, const T* x, T* y, CPUContext* context) {  \
     cblas_##prefix##axpy(N, alpha, x, 1, y, 1);                             \
-  }                                                                         \
   }                                                                         \
   template <>                                                               \
   void Axpy<T, CPUContext>(                                                 \
@@ -589,11 +569,14 @@ DEFINE_BROADCAST_BINARY_FUNCTION(Div, /)
 
 CAFFE2_SPECIALIZED_SET(float);
 CAFFE2_SPECIALIZED_SET(double);
+CAFFE2_SPECIALIZED_SET(int8_t);
+CAFFE2_SPECIALIZED_SET(int16_t);
 CAFFE2_SPECIALIZED_SET(int);
 CAFFE2_SPECIALIZED_SET(int64_t);
 CAFFE2_SPECIALIZED_SET(bool);
 CAFFE2_SPECIALIZED_SET(char);
 CAFFE2_SPECIALIZED_SET(uint8_t);
+CAFFE2_SPECIALIZED_SET(uint16_t);
 #undef CAFFE2_SPECIALIZED_SET
 
 #define CAFFE2_INSTANTIATE_BINARY_OP(name, op, T)                          \
@@ -666,6 +649,36 @@ void RandUniform<int, CPUContext>(
   }
 }
 
+#define CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE(T)                   \
+  template <>                                                       \
+  void RandUniformUnique<T, CPUContext>(                            \
+      const size_t n,                                               \
+      const T a,                                                    \
+      const T b,                                                    \
+      T* r,                                                         \
+      const size_t m,                                               \
+      const T* avoid,                                               \
+      CPUContext* context) {                                        \
+    CAFFE_ENFORCE_LE(                                               \
+        n, b - a - m + 1, "Cannot satisfy the unique requirement"); \
+    std::unordered_set<T> avoid_set(n);                             \
+    if (m) {                                                        \
+      avoid_set.insert(avoid, avoid + m);                           \
+    }                                                               \
+    std::uniform_int_distribution<T> distribution(a, b);            \
+    T v = 0;                                                        \
+    for (size_t i = 0; i < n; ++i) {                                \
+      do {                                                          \
+        v = distribution(context->RandGenerator());                 \
+      } while (avoid_set.count(v));                                 \
+      r[i] = v;                                                     \
+      avoid_set.insert(v);                                          \
+    }                                                               \
+  }
+
+CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE(int32_t);
+CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE(int64_t);
+#undef CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE
 
 template <>
 void RandGaussian<float, CPUContext>(
@@ -699,6 +712,111 @@ void Select<float, CPUContext>(
     DCHECK_LT(idx[i], D);
     y[i] = x[i * D + idx[i]];
   }
+}
+// Ported from caffe 1.
+template <>
+void Im2colNd<float, CPUContext, StorageOrder::NCHW>(
+    const float* data_img,
+    const int* im_shape,
+    const int* col_shape,
+    const int /* img_size*/,
+    const int /* col_size*/,
+    const int* kernel_shape,
+    const int* stride,
+    const int* dilation,
+    const int* pad,
+    const int N,
+    float* data_col,
+    CPUContext* /* context */,
+    bool accumulate_output) {
+  int kernel_size = 1;
+  for (int i = 0; i < N; ++i) {
+    kernel_size *= kernel_shape[i];
+  }
+  const int channels_col = col_shape[0];
+  vector<int> d_offset(N, 0);
+  vector<int> d_iter(N, 0);
+  for (int c_col = 0; c_col < channels_col; ++c_col) {
+    // Loop over spatial axes in reverse order to compute a per-axis offset.
+    int offset = c_col;
+    for (int d_i = N - 1; d_i >= 0; --d_i) {
+      if (d_i < N - 1) {
+        offset /= kernel_shape[d_i + 1];
+      }
+      d_offset[d_i] = offset % kernel_shape[d_i];
+    }
+    for (bool incremented = true; incremented;) {
+      // Loop over spatial axes in forward order to compute the indices in the
+      // image and column, and whether the index lies in the padding.
+      int index_col = c_col;
+      int index_im = c_col / kernel_size;
+      bool is_padding = false;
+      for (int d_i = 0; d_i < N; ++d_i) {
+        const int d = d_iter[d_i];
+        const int d_im =
+            d * stride[d_i] - pad[d_i] + d_offset[d_i] * dilation[d_i];
+        is_padding |= d_im < 0 || d_im >= im_shape[d_i + 1];
+        index_col *= col_shape[d_i + 1];
+        index_col += d;
+        index_im *= im_shape[d_i + 1];
+        index_im += d_im;
+      }
+      if (!accumulate_output) {
+        if (is_padding) {
+          data_col[index_col] = 0;
+        } else {
+          data_col[index_col] = data_img[index_im];
+        }
+      } else if (!is_padding) { // col2im
+        data_col[index_im] += data_img[index_col];
+      }
+      // Loop over spatial axes in reverse order to choose an index,
+      // like counting.
+      incremented = false;
+      for (int d_i = N - 1; d_i >= 0; --d_i) {
+        const int d_max = col_shape[d_i + 1];
+        DCHECK_LT(d_iter[d_i], d_max);
+        if (d_iter[d_i] == d_max - 1) {
+          d_iter[d_i] = 0;
+        } else { // d_iter[d_i] < d_max - 1
+          ++d_iter[d_i];
+          incremented = true;
+          break;
+        }
+      }
+    } // while(incremented) {
+  } // for (int c = 0; c < channels_col; ++c) {
+}
+
+template <>
+void Col2imNd<float, CPUContext, StorageOrder::NCHW>(
+    const float* data_col,
+    const int* img_shape,
+    const int* col_shape,
+    const int img_size,
+    const int col_size,
+    const int* kernel_shape,
+    const int* stride,
+    const int* dilation,
+    const int* pad,
+    const int N,
+    float* data_img,
+    CPUContext* context) {
+  Set<float, CPUContext>(img_size, 0, data_img, context);
+  Im2colNd<float, CPUContext, StorageOrder::NCHW>(
+      data_col,
+      img_shape,
+      col_shape,
+      img_size,
+      col_size,
+      kernel_shape,
+      stride,
+      dilation,
+      pad,
+      N,
+      data_img,
+      context,
+      true);
 }
 
 template <>

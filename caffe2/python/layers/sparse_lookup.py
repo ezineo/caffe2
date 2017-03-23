@@ -18,7 +18,7 @@ import operator
 
 class SparseLookup(ModelLayer):
     _supported_reducers = ['PositionWeighted', 'LogMeanExp', 'LogSumExp', 'Max',
-                           'Mean', 'Sum']
+                           'Mean', 'Sum', 'Sqrt']
 
     def __init__(self, model, input_record, inner_shape, reducer,
                  weight_init=None, weight_optim=None,
@@ -43,7 +43,8 @@ class SparseLookup(ModelLayer):
 
         self.output_schema = schema.Scalar(
             (np.float32, inner_shape),
-            core.ScopedBlobReference(model.net.NextName(self.name + '_output')))
+            model.net.NextScopedBlob(name + '_output'),
+        )
 
         if self.request_only:
             schema.attach_metadata_to_scalars(
@@ -61,7 +62,7 @@ class SparseLookup(ModelLayer):
         self.weight_init = weight_init if weight_init else (
             'UniformFill', {'min': -scale, 'max': scale})
 
-        self.w = core.ScopedBlobReference(model.net.NextName(self.name + "_w"))
+        self.w = model.net.NextScopedBlob(name + "_w")
         self.params.append(
             LayerParameter(
                 parameter=self.w,
@@ -75,8 +76,7 @@ class SparseLookup(ModelLayer):
             ))
 
         if reducer == 'PositionWeighted':
-            self.pos_w = core.ScopedBlobReference(
-                model.net.NextName(self.name + "_pos_w"))
+            self.pos_w = model.net.NextScopedBlob(name + "_pos_w")
             self.params.append(
                 LayerParameter(
                     parameter=self.pos_w,
@@ -92,6 +92,9 @@ class SparseLookup(ModelLayer):
     def get_memory_usage(self):
         return functools.reduce(operator.mul, self.shape) * 4
 
+    def get_fp16_compatible_parameters(self):
+        return [self.w]
+
     def add_ops(self, net):
         if schema.equal_schemas(self.input_record, IdList):
             if self.reducer == 'Sum':
@@ -101,7 +104,8 @@ class SparseLookup(ModelLayer):
                         self.input_record.items(),
                         self.input_record.lengths()
                     ],
-                    self.output_schema.field_blobs()
+                    self.output_schema.field_blobs(),
+                    engine='fp16'
                 )
             elif self.reducer == 'PositionWeighted':
                 inc_seq = net.LengthsRangeFill(
@@ -119,15 +123,34 @@ class SparseLookup(ModelLayer):
                         self.input_record.lengths()
                     ],
                     self.output_schema.field_blobs(),
-                    grad_on_weights=1
+                    grad_on_weights=1,
+                    engine='fp16'
+                )
+            elif self.reducer == 'Sqrt':
+                sqrt_weight = net.LengthsToWeights(
+                    [self.input_record.lengths()],
+                    [self.input_record.lengths() + '_sqrt'],
+                    power=0.5
+                )
+                net.SparseLengthsWeightedSum(
+                    [
+                        self.w,
+                        sqrt_weight,
+                        self.input_record.items(),
+                        self.input_record.lengths()
+                    ],
+                    self.output_schema.field_blobs(),
+                    engine='fp16'
                 )
             else:
-                table_rows = net.Gather([self.w, self.input_record.keys()])
+                table_rows = net.Gather([self.w, self.input_record.items()])
                 segment_ids = net.LengthsToSegmentIds(
-                    self.input_record.lengths())
+                    self.input_record.lengths(),
+                    self.input_record.lengths() + '_sid')
                 net.__getattr__('SortedSegmentRange' + self.reducer)(
                     [table_rows, segment_ids],
-                    self.output_schema.field_blobs()
+                    self.output_schema.field_blobs(),
+                    engine='fp16'
                 )
         elif schema.equal_schemas(self.input_record, IdScoreList):
             if self.reducer == 'Sum':
@@ -138,7 +161,8 @@ class SparseLookup(ModelLayer):
                         self.input_record.keys(),
                         self.input_record.lengths()
                     ],
-                    self.output_schema.field_blobs()
+                    self.output_schema.field_blobs(),
+                    engine='fp16'
                 )
             else:
                 raise "Only Sum is supported for IdScoreList input." +\

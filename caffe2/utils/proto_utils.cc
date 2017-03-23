@@ -1,7 +1,6 @@
 #include "caffe2/utils/proto_utils.h"
 
 #include <fcntl.h>
-#include <unistd.h>
 #include <cerrno>
 #include <fstream>
 
@@ -18,6 +17,27 @@ using ::google::protobuf::Message;
 using ::google::protobuf::MessageLite;
 
 namespace caffe2 {
+
+std::string DeviceTypeName(const int32_t& d) {
+  switch (d) {
+    case CPU:
+      return "CPU";
+    case CUDA:
+      return "CUDA";
+    case MKLDNN:
+      return "MKLDNN";
+    default:
+      CAFFE_THROW(
+          "Unknown device: ",
+          d,
+          ". If you have recently updated the caffe2.proto file to add a new "
+          "device type, did you forget to update the TensorDeviceTypeName() "
+          "function to reflect such recent changes?");
+      // The below code won't run but is needed to suppress some compiler
+      // warnings.
+      return "";
+  }
+};
 
 bool ReadStringFromFile(const char* filename, string* str) {
   std::ifstream ifs(filename, std::ios::in);
@@ -117,7 +137,11 @@ void WriteProtoToTextFile(const Message& proto, const char* filename) {
 }
 
 bool ReadProtoFromBinaryFile(const char* filename, MessageLite* proto) {
+#if defined (_MSC_VER)  // for MSC compiler binary flag needs to be specified
+  int fd = open(filename, O_RDONLY | O_BINARY);
+#else
   int fd = open(filename, O_RDONLY);
+#endif
   CAFFE_ENFORCE_NE(fd, -1, "File not found: ", filename);
   std::unique_ptr<ZeroCopyInputStream> raw_input(new FileInputStream(fd));
   std::unique_ptr<CodedInputStream> coded_input(
@@ -181,7 +205,17 @@ bool ArgumentHelper::HasArgument(const string& name) const {
   return arg_map_.count(name);
 }
 
-#define INSTANTIATE_GET_SINGLE_ARGUMENT(T, fieldname)                         \
+namespace {
+// Helper function to verify that conversion between types won't loose any
+// significant bit.
+template <typename InputType, typename TargetType>
+bool SupportsLosslessConversion(const InputType& value) {
+  return static_cast<InputType>(static_cast<TargetType>(value)) == value;
+}
+}
+
+#define INSTANTIATE_GET_SINGLE_ARGUMENT(                                      \
+    T, fieldname, enforce_lossless_conversion)                                \
   template <>                                                                 \
   T ArgumentHelper::GetSingleArgument<T>(                                     \
       const string& name, const T& default_value) const {                     \
@@ -195,7 +229,19 @@ bool ArgumentHelper::HasArgument(const string& name) const {
         "Argument ",                                                          \
         name,                                                                 \
         " does not have the right field: expected field " #fieldname);        \
-    return arg_map_.at(name)->fieldname();                                    \
+    auto value = arg_map_.at(name)->fieldname();                              \
+    if (enforce_lossless_conversion) {                                        \
+      auto supportsConversion =                                               \
+          SupportsLosslessConversion<decltype(value), T>(value);              \
+      CAFFE_ENFORCE(                                                          \
+          supportsConversion,                                                 \
+          "Value",                                                            \
+          value,                                                              \
+          " of argument ",                                                    \
+          name,                                                               \
+          "cannot be represented correctly in a target type");                \
+    }                                                                         \
+    return value;                                                             \
   }                                                                           \
   template <>                                                                 \
   bool ArgumentHelper::HasSingleArgumentOfType<T>(const string& name) const { \
@@ -205,32 +251,55 @@ bool ArgumentHelper::HasArgument(const string& name) const {
     return arg_map_.at(name)->has_##fieldname();                              \
   }
 
-INSTANTIATE_GET_SINGLE_ARGUMENT(float, f)
-INSTANTIATE_GET_SINGLE_ARGUMENT(int, i)
-INSTANTIATE_GET_SINGLE_ARGUMENT(bool, i)
-INSTANTIATE_GET_SINGLE_ARGUMENT(int64_t, i)
-INSTANTIATE_GET_SINGLE_ARGUMENT(size_t, i)
-INSTANTIATE_GET_SINGLE_ARGUMENT(string, s)
+INSTANTIATE_GET_SINGLE_ARGUMENT(float, f, false)
+INSTANTIATE_GET_SINGLE_ARGUMENT(double, f, false)
+INSTANTIATE_GET_SINGLE_ARGUMENT(bool, i, false)
+INSTANTIATE_GET_SINGLE_ARGUMENT(int8_t, i, true)
+INSTANTIATE_GET_SINGLE_ARGUMENT(int16_t, i, true)
+INSTANTIATE_GET_SINGLE_ARGUMENT(int, i, true)
+INSTANTIATE_GET_SINGLE_ARGUMENT(int64_t, i, true)
+INSTANTIATE_GET_SINGLE_ARGUMENT(uint8_t, i, true)
+INSTANTIATE_GET_SINGLE_ARGUMENT(uint16_t, i, true)
+INSTANTIATE_GET_SINGLE_ARGUMENT(size_t, i, true)
+INSTANTIATE_GET_SINGLE_ARGUMENT(string, s, false)
 #undef INSTANTIATE_GET_SINGLE_ARGUMENT
 
-#define INSTANTIATE_GET_REPEATED_ARGUMENT(T, fieldname)                        \
+#define INSTANTIATE_GET_REPEATED_ARGUMENT(                                     \
+    T, fieldname, enforce_lossless_conversion)                                 \
   template <>                                                                  \
   vector<T> ArgumentHelper::GetRepeatedArgument<T>(const string& name) const { \
     if (arg_map_.count(name) == 0) {                                           \
       return vector<T>();                                                      \
     }                                                                          \
     vector<T> values;                                                          \
-    for (const auto& v : arg_map_.at(name)->fieldname())                       \
+    for (const auto& v : arg_map_.at(name)->fieldname()) {                     \
+      if (enforce_lossless_conversion) {                                       \
+        auto supportsConversion =                                              \
+            SupportsLosslessConversion<decltype(v), T>(v);                     \
+        CAFFE_ENFORCE(                                                         \
+            supportsConversion,                                                \
+            "Value",                                                           \
+            v,                                                                 \
+            " of argument ",                                                   \
+            name,                                                              \
+            "cannot be represented correctly in a target type");               \
+      }                                                                        \
       values.push_back(v);                                                     \
+    }                                                                          \
     return values;                                                             \
   }
 
-INSTANTIATE_GET_REPEATED_ARGUMENT(float, floats)
-INSTANTIATE_GET_REPEATED_ARGUMENT(int, ints)
-INSTANTIATE_GET_REPEATED_ARGUMENT(bool, ints)
-INSTANTIATE_GET_REPEATED_ARGUMENT(int64_t, ints)
-INSTANTIATE_GET_REPEATED_ARGUMENT(size_t, ints)
-INSTANTIATE_GET_REPEATED_ARGUMENT(string, strings)
+INSTANTIATE_GET_REPEATED_ARGUMENT(float, floats, false)
+INSTANTIATE_GET_REPEATED_ARGUMENT(double, floats, false)
+INSTANTIATE_GET_REPEATED_ARGUMENT(bool, ints, false)
+INSTANTIATE_GET_REPEATED_ARGUMENT(int8_t, ints, true)
+INSTANTIATE_GET_REPEATED_ARGUMENT(int16_t, ints, true)
+INSTANTIATE_GET_REPEATED_ARGUMENT(int, ints, true)
+INSTANTIATE_GET_REPEATED_ARGUMENT(int64_t, ints, true)
+INSTANTIATE_GET_REPEATED_ARGUMENT(uint8_t, ints, true)
+INSTANTIATE_GET_REPEATED_ARGUMENT(uint16_t, ints, true)
+INSTANTIATE_GET_REPEATED_ARGUMENT(size_t, ints, true)
+INSTANTIATE_GET_REPEATED_ARGUMENT(string, strings, false)
 #undef INSTANTIATE_GET_REPEATED_ARGUMENT
 
 #define CAFFE2_MAKE_SINGULAR_ARGUMENT(T, fieldname)                            \

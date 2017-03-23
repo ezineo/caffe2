@@ -20,16 +20,18 @@ import logging
 import numpy as np
 from caffe2.python import core
 from caffe2.python import workspace
-from caffe2.python.core import ScopedBlobReference, BlobReference
+from caffe2.python.core import BlobReference
 from collections import OrderedDict, namedtuple
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+FIELD_SEPARATOR = ':'
+
 
 def _join_field_name(prefix, suffix):
     if prefix and suffix:
-        return '{}:{}'.format(prefix, suffix)
+        return '{}{}{}'.format(prefix, FIELD_SEPARATOR, suffix)
     elif prefix:
         return prefix
     elif suffix:
@@ -234,22 +236,65 @@ class Struct(Field):
     """
 
     def __init__(self, *fields):
+        """ fields is a list of tuples in format of (name, field). The name is
+        a string of nested name, e.g., `a`, `a:b`, `a:b:c`. For example
+
+        Struct(
+          ('a', Scalar()),
+          ('b:c', Scalar()),
+          ('b:d:e', Scalar()),
+          ('b', Struct(
+            ('f', Scalar()),
+          )),
+        )
+
+        is equal to
+
+        Struct(
+          ('a', Scalar()),
+          ('b', Struct(
+            ('c', Scalar()),
+            ('d', Struct(('e', Scalar()))),
+            ('f', Scalar()),
+          )),
+        )
+        """
         for field in fields:
             assert len(field) == 2
             assert field[0], 'Field names cannot be empty'
             assert field[0] != 'lengths', (
                 'Struct cannot contain a field named `lengths`.'
             )
-        existing = set()
-        for name, field in fields:
-            if name in existing:
-                raise ValueError('Duplicate field name: %s' % name)
-            existing.add(name)
         fields = [(name, _normalize_field(field)) for name, field in fields]
-        for id, (name, field) in enumerate(fields):
+        self.fields = OrderedDict()
+        for name, field in fields:
+            if FIELD_SEPARATOR in name:
+                name, field = self._struct_from_nested_name(name, field)
+            if name not in self.fields:
+                self.fields[name] = field
+                continue
+            if (
+                    not isinstance(field, Struct) or
+                    not isinstance(self.fields[name], Struct)
+            ):
+                raise ValueError('Duplicate field name: %s' % name)
+            self.fields[name] = self.fields[name] + field
+        for id, (_, field) in enumerate(self.fields.items()):
             field._set_parent(self, id)
-        self.fields = OrderedDict(fields)
         Field.__init__(self, self.fields.values())
+
+    def _struct_from_nested_name(self, nested_name, field):
+        def create_internal(nested_name, field):
+            names = nested_name.split(FIELD_SEPARATOR, 1)
+            if len(names) == 1:
+                added_field = field
+            else:
+                added_field = create_internal(names[1], field)
+            return Struct((names[0], added_field))
+
+        names = nested_name.split(FIELD_SEPARATOR, 1)
+        assert len(names) >= 2
+        return names[0], create_internal(names[1], field)
 
     def get_children(self):
         return self.fields.items()
@@ -262,25 +307,25 @@ class Struct(Field):
 
     def field_types(self):
         types = []
-        for name, field in self.fields.items():
+        for _, field in self.fields.items():
             types += field.field_types()
         return types
 
     def field_metadata(self):
         metadata = []
-        for name, field in self.fields.items():
+        for _, field in self.fields.items():
             metadata += field.field_metadata()
         return metadata
 
     def field_blobs(self):
         blobs = []
-        for name, field in self.fields.items():
+        for _, field in self.fields.items():
             blobs += field.field_blobs()
         return blobs
 
     def all_scalars(self):
         scalars = []
-        for name, field in self.fields.items():
+        for _, field in self.fields.items():
             scalars += field.all_scalars()
         return scalars
 
@@ -294,10 +339,31 @@ class Struct(Field):
         ]
         return Struct(*normalized_fields)
 
+    def _get_field_by_nested_name(self, nested_name):
+        names = nested_name.split(FIELD_SEPARATOR)
+        curr = self
+        for name in names:
+            if not isinstance(curr, Struct):
+                return None
+            if name not in curr.fields:
+                return None
+            curr = curr.fields[name]
+        return curr
+
+    def __contains__(self, item):
+        field = self._get_field_by_nested_name(item)
+        return field is not None
+
     def __len__(self):
         return len(self.fields)
 
     def __getitem__(self, item):
+        """
+        item can be a tuple or list of ints or strings, or a single
+        int or string. String item is a nested field name, e.g., "a", "a:b",
+        "a:b:c". Int item is the index of a field at the first level of the
+        Struct.
+        """
         if isinstance(item, list) or isinstance(item, tuple):
             return Struct(
                 * [
@@ -310,7 +376,10 @@ class Struct(Field):
         elif isinstance(item, int):
             return self.fields.values()[item]
         else:
-            return self.fields[item]
+            field = self._get_field_by_nested_name(item)
+            if not field:
+                raise KeyError
+            return field
 
     def __getattr__(self, item):
         if item.startswith('__'):
@@ -322,11 +391,44 @@ class Struct(Field):
 
     def __add__(self, other):
         """
-        Allows to merge fields of two schema.Struct using '+' operator
+        Allows to merge fields of two schema.Struct using '+' operator.
+        If two Struct have common field names, the merge is conducted
+        recursively. Here are examples:
+
+        Example 1
+        s1 = Struct(('a', Scalar()))
+        s2 = Struct(('b', Scalar()))
+        s1 + s2 == Struct(
+            ('a', Scalar()),
+            ('b', Scalar()),
+        )
+
+        Example 2
+        s1 = Struct(
+            ('a', Scalar()),
+            ('b', Struct(('c', Scalar()))),
+        )
+        s2 = Struct(('b', Struct(('d', Scalar()))))
+        s1 + s2 == Struct(
+            ('a', Scalar()),
+            ('b', Struct(
+                ('c', Scalar()),
+                ('d', Scalar()),
+            )),
+        )
         """
         if not isinstance(other, Struct):
             return NotImplemented
-        return Struct(*(self.get_children() + other.get_children()))
+
+        children = OrderedDict(self.get_children())
+        for name, right_field in other.get_children():
+            if name not in children:
+                children[name] = right_field
+                continue
+            left_field = children[name]
+            children[name] = left_field + right_field
+
+        return Struct(*(children.items()))
 
 
 class Scalar(Field):
@@ -474,8 +576,8 @@ class Scalar(Field):
                 if blob.size == 0:
                     blob = blob.reshape((0, ) + dtype.shape)
             else:
-                assert isinstance(blob, np.ndarray
-                                 ), ('Invalid blob type: %s' % str(type(blob)))
+                assert isinstance(blob, np.ndarray), (
+                    'Invalid blob type: %s' % str(type(blob)))
 
             # reshape scalars into 1D arrays
             # TODO(azzolini): figure out better way of representing this
@@ -533,20 +635,25 @@ def Map(
     )
 
 
+def NamedTuple(name_prefix, *fields):
+    return Struct(* [('%s_%d' % (name_prefix, i), field)
+                     for i, field in enumerate(fields)])
+
+
 def Tuple(*fields):
     """
     Creates a Struct with default, sequential, field names of given types.
     """
-    return Struct(* [('field_%d' % i, field) for i, field in enumerate(fields)])
+    return NamedTuple('field', *fields)
 
 
-def RawTuple(num_fields):
+def RawTuple(num_fields, name_prefix='field'):
     """
     Creates a tuple of `num_field` untyped scalars.
     """
     assert isinstance(num_fields, int)
-    assert num_fields > 0
-    return Tuple(*([np.void] * num_fields))
+    assert num_fields >= 0
+    return NamedTuple(name_prefix, *([np.void] * num_fields))
 
 
 def from_dtype(dtype, _outer_shape=()):
@@ -678,7 +785,7 @@ def from_column_list(
     for col_name, col_type, col_blob, col_metadata in zip(
         col_names, col_types, col_blobs, col_metadata
     ):
-        columns = col_name.split(':')
+        columns = col_name.split(FIELD_SEPARATOR)
         current = root
         for i in range(len(columns)):
             name = columns[i]
@@ -785,19 +892,21 @@ def FeedRecord(blob_record, arrays, ws=None):
 def NewRecord(net, schema):
     """
     Given a record of np.arrays, create a BlobReference for each one of them,
-    returning a record containing BlobReferences. The BlobReferences will be
-    added as ExternalInputs of the given net.
+    returning a record containing BlobReferences. The name of each returned blob
+    is NextScopedBlob(field_name), which guarantees unique name in the current
+    net. Use NameScope explicitly to avoid name conflictions between different
+    nets.
     """
     if isinstance(schema, Scalar):
         result = schema.clone()
         result.set_value(
-            blob=ScopedBlobReference(net.NextName('unnamed_scalar'))
+            blob=net.NextScopedBlob('unnamed_scalar')
         )
         return result
 
     assert isinstance(schema, Field), 'Record must be a schema.Field instance.'
     blob_refs = [
-        net.AddExternalInput(net.NextName(prefix=name))
+        net.NextScopedBlob(prefix=name)
         for name in schema.field_names()
     ]
     return from_blob_list(schema, blob_refs)
@@ -816,13 +925,30 @@ def ConstRecord(net, array_record):
     return blob_record
 
 
-def InitEmptyRecord(net, schema_or_record):
+def InitEmptyRecord(net, schema_or_record, enforce_types=False):
     if not schema_or_record.has_blobs():
         record = NewRecord(net, schema_or_record)
     else:
         record = schema_or_record
-    for blob in record.field_blobs():
-        net.ConstantFill([], blob, shape=[0])
+
+    for blob_type, blob in zip(record.field_types(), record.field_blobs()):
+        try:
+            data_type = data_type_for_dtype(blob_type)
+            shape = [0] + list(blob_type.shape)
+            net.ConstantFill([], blob, shape=shape, dtype=data_type)
+        except TypeError:
+            # If data_type_for_dtype doesn't know how to resolve given numpy
+            # type to core.DataType, that function can throw type error (for
+            # example that would happen for cases of unknown types such as
+            # np.void). This is not a problem for cases when the record if going
+            # to be overwritten by some operator later, though it might be an
+            # issue for type/shape inference.
+            if enforce_types:
+                raise
+            # If we don't enforce types for all items we'll create a blob with
+            # the default ConstantFill (FLOAT, no shape)
+            net.ConstantFill([], blob, shape=[0])
+
     return record
 
 
@@ -842,8 +968,8 @@ _DATA_TYPE_FOR_DTYPE = [
 
 def is_schema_subset(schema, original_schema):
     # TODO add more checks
-    return set(schema.field_names()
-              ).issubset(set(original_schema.field_names()))
+    return set(schema.field_names()).issubset(
+        set(original_schema.field_names()))
 
 
 def equal_schemas(schema, original_schema):

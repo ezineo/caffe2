@@ -40,6 +40,10 @@ class FillerOp : public Operator<Context> {
       if (input_as_shape_) {
         CAFFE_THROW("An input must be given if input_as_shape is true");
       }
+      if (shape_.size() == 0 &&
+          OperatorBase::HasSingleArgumentOfType<int>("shape")) {
+        CAFFE_THROW("Fill 'shape' argument was a scalar, list expected");
+      }
     }
   }
 
@@ -105,6 +109,75 @@ class UniformFillOp final : public FillerOp<Context> {
 };
 
 template <class Context>
+class UniqueUniformFillOp final : public FillerOp<Context> {
+ public:
+  USE_OPERATOR_CONTEXT_FUNCTIONS;
+  UniqueUniformFillOp(const OperatorDef& operator_def, Workspace* ws)
+      : FillerOp<Context>(operator_def, ws) {
+    TensorProto_DataType dtype =
+        static_cast<TensorProto_DataType>(OperatorBase::GetSingleArgument<int>(
+            "dtype", TensorProto_DataType_INT32));
+
+    switch (dtype) {
+      case TensorProto_DataType_INT32:
+        CheckRange<int>();
+        body_ = &UniqueUniformFillOp::FillWithType<int>;
+        break;
+      case TensorProto_DataType_INT64:
+        CheckRange<int64_t>();
+        body_ = &UniqueUniformFillOp::FillWithType<int64_t>;
+        break;
+      case TensorProto_DataType_UNDEFINED:
+        CAFFE_THROW(
+            "UniqueUniformFill op cannot have undefined 'dtype' argument");
+      // break;
+      default:
+        CAFFE_THROW("Unexpected 'dtype' argument value: ", dtype);
+    }
+  }
+
+  bool Fill(Tensor<Context>* output) override {
+    return (this->*body_)(output);
+  }
+
+ private:
+  template <typename T>
+  void CheckRange() {
+    CAFFE_ENFORCE(OperatorBase::HasSingleArgumentOfType<T>("min"));
+    CAFFE_ENFORCE(OperatorBase::HasSingleArgumentOfType<T>("max"));
+    CAFFE_ENFORCE_LT(
+        OperatorBase::GetSingleArgument<T>("min", 0),
+        OperatorBase::GetSingleArgument<T>("max", 0),
+        "Max value should be bigger than min value.");
+  }
+
+  template <typename T>
+  bool FillWithType(Tensor<Context>* output) {
+    T min = OperatorBase::GetSingleArgument<T>("min", 0);
+    T max = OperatorBase::GetSingleArgument<T>("max", 0);
+
+    const T* avoid_data = nullptr;
+    size_t avoid_size = 0;
+    if (InputSize() >= 2) {
+      auto& avoid = Input(1);
+      avoid_data = avoid.template data<T>();
+      avoid_size = avoid.size();
+    }
+    math::RandUniformUnique<T, Context>(
+        output->size(),
+        min,
+        max,
+        output->template mutable_data<T>(),
+        avoid_size,
+        avoid_data,
+        &context_);
+    return true;
+  }
+
+  bool (UniqueUniformFillOp::*body_)(Tensor<Context>* output);
+};
+
+template <class Context>
 class ConstantFillOp final : public FillerOp<Context> {
  public:
   USE_OPERATOR_CONTEXT_FUNCTIONS;
@@ -133,14 +206,32 @@ class ConstantFillOp final : public FillerOp<Context> {
       case TensorProto_DataType_FLOAT:
         body_ = &ConstantFillOp::FillWithType<float>;
         break;
-      case TensorProto_DataType_INT32:
-        body_ = &ConstantFillOp::FillWithType<int>;
+      case TensorProto_DataType_DOUBLE:
+        body_ = &ConstantFillOp::FillWithType<double>;
         break;
       case TensorProto_DataType_BOOL:
         body_ = &ConstantFillOp::FillWithType<bool>;
         break;
+      case TensorProto_DataType_INT8:
+        body_ = &ConstantFillOp::FillWithType<int8_t>;
+        break;
+      case TensorProto_DataType_INT16:
+        body_ = &ConstantFillOp::FillWithType<int16_t>;
+        break;
+      case TensorProto_DataType_INT32:
+        body_ = &ConstantFillOp::FillWithType<int>;
+        break;
       case TensorProto_DataType_INT64:
         body_ = &ConstantFillOp::FillWithType<int64_t>;
+        break;
+      case TensorProto_DataType_UINT8:
+        body_ = &ConstantFillOp::FillWithType<uint8_t>;
+        break;
+      case TensorProto_DataType_UINT16:
+        body_ = &ConstantFillOp::FillWithType<uint16_t>;
+        break;
+      case TensorProto_DataType_STRING:
+        body_ = &ConstantFillOp::FillWithString;
         break;
       case TensorProto_DataType_UNDEFINED:
         CAFFE_THROW("ConstantFill op cannot have undefined 'dtype' argument");
@@ -164,37 +255,17 @@ class ConstantFillOp final : public FillerOp<Context> {
     return true;
   }
 
- private:
-  bool (ConstantFillOp::*body_)(Tensor<Context>* output);
-};
-
-template <typename T, class Context>
-class GivenTensorFillOp final : public FillerOp<Context> {
- public:
-  USE_OPERATOR_CONTEXT_FUNCTIONS;
-  GivenTensorFillOp(const OperatorDef& operator_def, Workspace* ws)
-      : FillerOp<Context>(operator_def, ws) {
-    auto source_values =
-        OperatorBase::template GetRepeatedArgument<T>("values");
-    for (T f : source_values) {
-      values_.push_back(static_cast<T>(f));
-    }
-  }
-
-  bool Fill(Tensor<Context>* output) override {
-    DCHECK_EQ(output->size(), values_.size())
-        << "output size: " << output->size()
-        << " given size: " << values_.size();
-    auto* data = output->template mutable_data<T>();
-    if (output->size()) {
-      context_.template Copy<T, CPUContext, Context>(
-          output->size(), values_.data(), data);
+  bool FillWithString(Tensor<Context>* output) {
+    auto value = OperatorBase::GetSingleArgument<std::string>("value", "");
+    auto* data = output->template mutable_data<std::string>();
+    for (int i = 0; i < output->size(); ++i) {
+      data[i] = value;
     }
     return true;
   }
 
  private:
-  vector<T> values_;
+  bool (ConstantFillOp::*body_)(Tensor<Context>* output);
 };
 
 template <typename T, class Context>
@@ -307,6 +378,34 @@ class LengthsRangeFillOp : public Operator<Context> {
     return true;
   }
 };
+
+inline std::vector<TensorShape> FillerTensorInference(
+    const OperatorDef& def,
+    const vector<TensorShape>& in) {
+  vector<TensorShape> out(1);
+  ArgumentHelper helper(def);
+  out[0].set_data_type(static_cast<TensorProto_DataType>(
+      helper.GetSingleArgument<int>("dtype", TensorProto_DataType_FLOAT)));
+
+  if (in.size()) {
+    // TODO
+    bool input_as_shape =
+        helper.GetSingleArgument<bool>("input_as_shape", false);
+    if (input_as_shape) {
+      out[0].set_unknown_shape(true);
+      return out;
+    }
+    for (int d : in[0].dims()) {
+      out[0].add_dims(d);
+    }
+  } else {
+    auto shape = helper.GetRepeatedArgument<int>("shape");
+    for (int d : shape) {
+      out[0].add_dims(d);
+    }
+  }
+  return out;
+}
 
 } // namespace caffe2
 

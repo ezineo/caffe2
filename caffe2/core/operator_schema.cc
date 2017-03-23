@@ -54,18 +54,19 @@ bool OpSchema::Verify(const OperatorDef& def) const {
       if (def.input(in_idx) == def.output(out_idx) &&
           (!inplace_allowed_(in_idx, out_idx)
           && !inplace_enforced_(in_idx, out_idx))) {
-        LOG(ERROR)
-            << "Input index " << in_idx << " and output idx "
-            << out_idx << " are set to be in-place but this is actually not "
-            << "supported by op " << def.type();
+        LOG(ERROR) << "Input index " << in_idx << " and output idx " << out_idx
+                   << " (" << def.input(in_idx) << ")"
+                   << " are set to be in-place but this is actually not "
+                   << "supported by op " << def.type();
         return false;
       }
       if (def.input(in_idx) != def.output(out_idx) &&
           inplace_enforced_(in_idx, out_idx)) {
-        LOG(ERROR)
-            << "Input index " << in_idx << " and output idx " << out_idx
-            << " are not in-place but should be as required by op "
-            << def.type();
+        LOG(ERROR) << "Input index " << in_idx << " (" << def.input(in_idx) << ")"
+                   << " and output idx " << out_idx
+                   << " (" << def.output(in_idx) << ")"
+                   << " are not in-place but should be as required by op "
+                   << def.type();
         return false;
       }
     }
@@ -187,11 +188,20 @@ OpSchema& OpSchema::IdenticalTypeAndShapeOfInput(int idx) {
       });
 }
 
+OpSchema& OpSchema::IdenticalTypeAndShapeOfInputDim(int idx, int dim) {
+  return TensorInferenceFunction(
+      [idx, dim](const OperatorDef&, const vector<TensorShape>& input_types) {
+        vector<TensorShape> out(1);
+        out[0].add_dims(input_types[idx].dims(dim));
+        out[0].set_data_type(input_types[idx].data_type());
+        return out;
+      });
+}
+
 OpSchema& OpSchema::ScalarType(::caffe2::TensorProto_DataType dt) {
   return TensorInferenceFunction(
      [dt](const OperatorDef&, const vector<TensorShape>& input_types) {
        vector<TensorShape> out(1);
-       out[0].add_dims(1);
        out[0].set_data_type(dt);
        return out;
      });

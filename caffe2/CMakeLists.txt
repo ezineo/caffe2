@@ -74,7 +74,7 @@ list(APPEND Caffe2_MAIN_LIBS_ORDER Caffe2_CPU)
 if (BUILD_SHARED_LIBS)
   list(APPEND Caffe2_MAIN_LIBS Caffe2_CPU)
 else()
-    caffe_add_whole_archive_flag(Caffe2_CPU tmp)
+  caffe_add_whole_archive_flag(Caffe2_CPU tmp)
   list(APPEND Caffe2_MAIN_LIBS ${tmp})
 endif()
 
@@ -118,6 +118,10 @@ endif()
 
 if (BUILD_PYTHON)
   # ---[ Python.
+  # ---[ Apple specific
+  if (APPLE)
+    set(CMAKE_SHARED_LIBRARY_SUFFIX ".so")
+  endif()
   add_library(caffe2_pybind11_state SHARED ${Caffe2_CPU_PYTHON_SRCS})
   add_dependencies(caffe2_pybind11_state ${Caffe2_MAIN_LIBS_ORDER})
   set_target_properties(caffe2_pybind11_state PROPERTIES PREFIX "")

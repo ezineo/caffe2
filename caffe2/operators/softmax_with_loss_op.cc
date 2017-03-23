@@ -9,8 +9,46 @@ REGISTER_CPU_OPERATOR(
     SoftmaxWithLossGradientOp<float, CPUContext>);
 
 // Input: X (logits), T (labels); Output: P (probs), Y
-// TODO: add Shape inference function (bootcamp)
-OPERATOR_SCHEMA(SoftmaxWithLoss).NumOutputs(2).SetDoc(R"DOC(
+OPERATOR_SCHEMA(SoftmaxWithLoss)
+    .NumInputs(2, 3)
+    .NumOutputs(2)
+    .TensorInferenceFunction(
+        [](const OperatorDef& def, const vector<TensorShape>& in) {
+          ArgumentHelper helper(def);
+          auto spatial_mode = helper.GetSingleArgument<int32_t>("spatial", 0);
+
+          vector<TensorShape> out(2);
+
+          auto logits = in[0]; // Tensor with Shape [batch_size, num_classes]
+          auto labels = in[1]; // Tensor with same shape as logits
+
+          auto batch_size = logits.dims().Get(0);
+          auto num_classes = logits.dims().Get(1);
+
+          if (!spatial_mode) {
+            // Labels must only be 1D or 2D
+            CAFFE_ENFORCE(labels.dims().size() <= 2);
+
+            // Labels must have the same amount of elements as batch_size
+            CAFFE_ENFORCE(batch_size == labels.dims().Get(0));
+
+            out[0].set_data_type(logits.data_type());
+            out[0].add_dims(batch_size);
+            out[0].add_dims(num_classes);
+          } else {
+            DCHECK_EQ(logits.dims_size(), 4);
+            DCHECK_EQ(labels.dims_size(), 3);
+            out[0].set_data_type(logits.data_type());
+            out[0].add_dims(batch_size);
+            out[0].add_dims(num_classes);
+            out[0].add_dims(in[0].dims(2));
+            out[0].add_dims(in[0].dims(3));
+          }
+
+          // Output 2 is scalar shape, so no dims added
+          return out;
+        })
+    .SetDoc(R"DOC(
 Combined Softmax and Cross-Entropy loss operator.
 The operator computes the softmax normalized values for each layer in the batch
 of the given input, after which cross-entropy loss is computed. This operator is
@@ -25,7 +63,17 @@ Use parameter label_prob=1 to enable inputting labels as a probability
 distribution.  Currently does not handle spatial=1 case.
 Optional third input blob can be used to weight the samples for the loss.
 For the spatial version, weighting is by x,y position of the input.
-)DOC");
+)DOC")
+    .Input(0, "logits", "Unscaled log probabilities")
+    .Input(1, "labels", "Ground truth")
+    .Input(
+        2,
+        "weight_tensor",
+        "Optional blob to be used to weight the samples for the loss. With\
+        spatial set, weighting is by x,y of the input")
+    .Output(0, "softmax", "Tensor with softmax cross entropy loss")
+    .Output(1, "loss", "Average loss");
+
 // Input: X, T, P, dY; Output: dX
 OPERATOR_SCHEMA(SoftmaxWithLossGradient).NumOutputs(1);
 
@@ -80,7 +128,7 @@ bool SoftmaxWithLossOp<float, CPUContext>::RunOnDevice() {
 
       for (int i = 0; i < N; ++i) {
         CAFFE_ENFORCE(
-            label_data[i] < D,
+            label_data[i] < D && label_data[i] >= 0,
             "Label seems incorrect: label value larger than number of classes: ",
             label_data[i],
             " vs ",
@@ -173,6 +221,12 @@ bool SoftmaxWithLossOp<float, CPUContext>::RunOnDevice() {
           int label_idx = i * H * W + y * W + x;
           int label = label_data[label_idx];
           if (label != DONT_CARE) {
+            CAFFE_ENFORCE(
+                label < D && label >= 0,
+                "Label seems incorrect: label value larger than number of classes: ",
+                label_data[i],
+                " vs ",
+                D);
             int idx = i * (H * W * D) + label * (H * W) + y * W + x;
             float w = weights ? weights[label_idx] : 1.0;
             total_weight += w;

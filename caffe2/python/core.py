@@ -9,9 +9,17 @@ from collections import OrderedDict
 from caffe2.proto import caffe2_pb2
 from collections import defaultdict
 from caffe2.python import scope, utils, workspace
-import numpy as np
-
 import caffe2.python._import_c_extension as C
+import numpy as np
+import sys
+
+
+# Mac os specific message
+if (sys.platform == 'darwin' and 'leveldb' in C.registered_dbs()):
+    print('If you are using homebrew leveldb on a Mac OS, you might see an '
+          'error warning you that malloc_zone_unregister() failed. This is '
+          'not a caffe2 issue but is due to the homebrew leveldb having an '
+          'incompatible memory allocator. It does not affect usage.')
 
 # Convenience redirections to functions inside scope.
 DeviceScope = scope.DeviceScope
@@ -186,7 +194,9 @@ class BlobReference(object):
                 'explicit net object.')
         if not IsOperator(op_type):
             raise RuntimeError(
-                'Method ' + op_type + ' is not a registered operator.'
+                'Method ' + op_type + ' is not a registered operator.' +
+                ' Did you mean: [' +
+                ",".join(workspace.C.nearby_opnames(op_type)) + ']'
             )
         return lambda *args, **kwargs: self._CreateAndAddToNet(
             op_type, *args, **kwargs)
@@ -298,6 +308,7 @@ def _RegisterPythonImpl(f, grad_f=None, pass_workspace=False):
     if grad_f:
         C.register_python_gradient_op(token, grad_f)
     return token
+
 
 def CreatePythonOperator(
     f, inputs,
@@ -1066,7 +1077,7 @@ def clone_and_bind_net(net, name, prefix, blob_remap=None, inputs=None,
         # TODO(azzolini): improve schema type checking
         diff = set(original.field_names()) - set(inputs.field_names())
         assert len(diff) == 0, \
-            'Schemas do not match, extra fields found in the net'.format(diff)
+            "Schemas don't match, extra fields {} found in the net".format(diff)
         original_mapping = dict(zip(original.field_names(),
                                     original.field_blobs()))
         for fn, fb in zip(inputs.field_names(), inputs.field_blobs()):
@@ -1126,6 +1137,9 @@ class Net(object):
         """
         self._input_record = None
         self._output_record = None
+        # Register blobs so that it's guaranteed that different calls to
+        # NextBlob/NextScopedBlob always return blobs with different names
+        self._registered_blob_names = set()
         self._recreate_lookup_tables = False
         self._op_outputs = set()
         self._external_input_map = set()
@@ -1207,6 +1221,24 @@ class Net(object):
         Attributes are user-defined objects added with `add_attribute'.
         """
         return self._attr_dict.get(name, [])
+
+    def set_rand_seed(self, seed=100, sequence_seed=True, seed_on_op_def=False):
+        """
+        Adds a random seed to each op in the net.
+        If sequence_seed is set, the i-th op has rand_seed=`seed + i`
+        If seed_on_op_def is set, the op rand_seed=hash(str(op))
+        sequence_seed and seed_on_op_def cannot be both set to True.
+        """
+        assert not (sequence_seed and seed_on_op_def), (
+            'sequence_seed and seed_on_op_def cannot be both set to True.')
+        for i, op in enumerate(self.Proto().op):
+            if sequence_seed:
+                curr_seed = seed + i
+            elif seed_on_op_def:
+                curr_seed = hash(str(op) + str(seed)) % np.iinfo(np.uint32).max
+            else:
+                curr_seed = seed
+            op.device_option.random_seed = curr_seed
 
     def Name(self):
         return self._net.name
@@ -1298,17 +1330,18 @@ class Net(object):
         new_proto = caffe2_pb2.NetDef()
         new_proto.CopyFrom(proto)
         new_proto.name = name
-        if blob_remap is None and op_id_mask is None:
-            # TODO(azzolini): should we also clone input_record here
-            return Net(new_proto)
 
         if blob_remap is None:
             blob_remap = {}
         if op_id_mask is None:
             op_id_mask = range(0, len(proto.op))
 
+        def get_remapped_str(blob):
+            blob_str = str(blob)
+            return str(blob_remap.get(blob_str, blob_str))
+
         def remap_list(proto_list):
-            new_list = [blob_remap.get(b, b) for b in proto_list]
+            new_list = [get_remapped_str(b) for b in proto_list]
             del proto_list[:]
             proto_list.extend(new_list)
 
@@ -1322,7 +1355,7 @@ class Net(object):
             return new_op
 
         del new_proto.op[:]
-        new_proto.op.extend(remap_op(proto.op[op_id]) for op_id in op_id_mask)
+        new_proto.op.extend([remap_op(proto.op[op_id]) for op_id in op_id_mask])
         remap_list(new_proto.external_input)
         remap_list(new_proto.external_output)
         new_net = Net(new_proto)
@@ -1333,7 +1366,7 @@ class Net(object):
                 new_net._input_record = schema.from_blob_list(
                     self._input_record,
                     [
-                        BlobReference(str(blob_remap[str(blob)]), net=new_net)
+                        BlobReference(get_remapped_str(blob), net=new_net)
                         for blob in self._input_record.field_blobs()
                     ],
                 )
@@ -1341,10 +1374,11 @@ class Net(object):
                 new_net._output_record = schema.from_blob_list(
                     self._output_record,
                     [
-                        BlobReference(str(blob_remap[str(blob)]), net=new_net)
+                        BlobReference(get_remapped_str(blob), net=new_net)
                         for blob in self._output_record.field_blobs()
                     ],
                 )
+
         new_net._attr_dict.update(self._attr_dict)
         return new_net
 
@@ -1416,9 +1450,34 @@ class Net(object):
         self._InvalidateLookupTables()
         return self._net
 
+    def NextScopedBlob(self, prefix='unnamed'):
+        """Return the blob that has not been defined or registered in the
+        current net. It returns `ScopedBlobReference(prefix)`, if it's valid,
+        otherwise `ScopedBlobReference(prefix) + '_auto_' + ?`. Different calls
+        is guaranteed to return blob with different names.
+        """
+        output_blob_base = ScopedName(prefix)
+        return self.NextBlob(output_blob_base)
+
+    def NextBlob(self, prefix='unnamed'):
+        """Return the blob that has not been defined or registered in the
+        current net. It returns `BlobReference(prefix)`, if it's valid,
+        otherwise `BlobReference(prefix) + '_auto_' + ?`. Different calls
+        is guaranteed to return blob with different names."""
+        output_blob_base = BlobReference(prefix)
+        output_blob = output_blob_base
+        index = 0
+        while str(output_blob) in self._registered_blob_names or (
+                self.BlobIsDefined(output_blob)):
+            output_blob = output_blob_base + '_auto_' + str(index)
+            index += 1
+
+        self._registered_blob_names.add(str(output_blob))
+        return output_blob
+
     def NextName(self, prefix=None, output_id=None):
         """Returns the next name to be used, if you do not want to explicitly
-        name your blob."""
+        name your blob. [Deprecated, use NextBlob, NextScopedBlob instead]"""
         if prefix:
             output_name_base = self._net.name + '/' + prefix
             output_name = output_name_base
@@ -1471,7 +1530,6 @@ class Net(object):
             self._external_input_map.add(inp)
 
         self._recreate_lookup_tables = False
-
 
     def AddGradientOperators(self, ys, skip=0):
         """Add the gradient for operators in the net.
@@ -1529,6 +1587,16 @@ class Net(object):
         for output in outputs:
             self.Proto().external_output.extend([str(output)])
 
+    def AddScopedExternalInputs(self, *inputs):
+        return self.AddExternalInput(
+            * [ScopedBlobReference(str(b)) for b in inputs]
+        )
+
+    def AddScopedExternalOutputs(self, *outputs):
+        return self.AddExternalOutput(
+            * [ScopedBlobReference(str(b)) for b in outputs]
+        )
+
     @property
     def external_inputs(self):
         return map(_get_blob_ref, self._net.external_input)
@@ -1542,7 +1610,8 @@ class Net(object):
         assert self._input_record is None, (
             'Input schema cannot be reset')
         if not input_record.has_blobs():
-            self._input_record = schema.NewRecord(self, input_record)
+            with NameScope(self.Name()):
+                self._input_record = schema.NewRecord(self, input_record)
         else:
             self._input_record = input_record
             for blob in input_record.field_blobs():
@@ -1558,6 +1627,19 @@ class Net(object):
         for blob in record.field_blobs():
             self.AddExternalOutput(blob)
         self._output_record = record
+
+    def AppendOutputRecordField(self, field_name, record):
+        from caffe2.python import schema
+        assert self._output_record is not None, (
+            'Tried to append to missing output record'
+        )
+        for blob in record.field_blobs():
+            assert self.BlobIsDefined(blob)
+        for blob in record.field_blobs():
+            self.AddExternalOutput(blob)
+        self._output_record = self._output_record + schema.Struct(
+            (field_name, record)
+        )
 
     def input_record(self):
         return self._input_record
@@ -1625,7 +1707,9 @@ class Net(object):
             raise AttributeError('Attribute {} not found.'.format(op_type))
         if not IsOperator(op_type):
             raise RuntimeError(
-                'Method ' + op_type + ' is not a registered operator.'
+                'Method ' + op_type + ' is not a registered operator.' +
+                ' Did you mean: [' +
+                ",".join(workspace.C.nearby_opnames(op_type)) + ']'
             )
         return lambda *args, **kwargs: self._CreateAndAddToSelf(
             op_type, *args, **kwargs)
@@ -1695,7 +1779,7 @@ def output_to_list(op_output):
 
 def _add_net_to_dict(net_dict, net):
     name = get_net_name(net)
-    if net in net_dict:
+    if name in net_dict:
         assert net_dict[name] is None or net == net_dict[name], (
             'Different nets with same name: ' + name)
         return False
@@ -1779,7 +1863,18 @@ class ExecutionStep(object):
         self._assert_can_mutate()
         self._step.should_stop_blob = str(should_stop_blob)
 
+    def RunEveryMillis(self, interval):
+        """
+        Run this step every interval millisecods, as long as its
+        siblings are still running. It is guaranteed that, after all
+        siblings finish, this step will run at least one.
+
+        This property is ignored for top-level ExecutionSteps.
+        """
+        self._step.run_every_ms = interval
+
     def SetReportNet(self, report_net, report_interval):
+        """ DEPRECATED. Use RunEveryMillis instead. """
         self._assert_can_mutate()
         _add_net_to_dict(self._net_dict, report_net)
         self._step.report_net = get_net_name(report_net)
@@ -1840,6 +1935,7 @@ def add_nets_in_order(step, net_list):
 
 
 class Plan(object):
+
     def __init__(self, name_or_step):
         self._plan = caffe2_pb2.PlanDef()
         self._net_dict = OrderedDict()

@@ -3,11 +3,12 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from caffe2.python import core, schema
+from caffe2.python import schema
 from caffe2.python.layers.layers import (
     ModelLayer,
 )
 import numpy as np
+
 
 class SparseToDense(ModelLayer):
     _known_types = ['FLOAT', 'ID_LIST']
@@ -32,9 +33,8 @@ class SparseToDense(ModelLayer):
                 outputs.append((
                     field,
                     schema.Scalar(
-                        (np.float32, len(feature_specs.feature_ids)),
-                        core.ScopedBlobReference(
-                            model.net.NextName(self.name + field + '_output'))
+                        (np.float32, (len(feature_specs.feature_ids), )),
+                        model.net.NextScopedBlob(name + '_' + field + '_output')
                     )
                 ))
             elif feature_specs.feature_type == 'ID_LIST':
@@ -47,10 +47,8 @@ class SparseToDense(ModelLayer):
                                     np.int32,
                                     (len(feature_specs.feature_ids), 2)
                                 ),
-                                core.ScopedBlobReference(
-                                    model.net.NextName(
-                                        self.name + field + '_ranges')
-                                )
+                                model.net.NextScopedBlob(
+                                    name + '_' + field + '_ranges')
                             ),
                          ),
                         ('values', input_record[field].values.items),
@@ -102,7 +100,8 @@ class SparseToDense(ModelLayer):
                 )
             elif feature_specs.feature_type == 'ID_LIST':
                 id_list_ranges = net.LengthsToRanges(
-                    record[field].values.lengths(), 1
+                    record[field].values.lengths(),
+                    net.NextScopedBlob('id_list_ranges')
                 )
                 net.SparseToDenseMask(
                     [

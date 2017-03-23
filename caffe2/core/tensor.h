@@ -174,7 +174,7 @@ class Tensor {
     CopyFrom(src, &tmp_context);
   }
 
-  virtual ~Tensor() {}
+  virtual ~Tensor() noexcept {}
 
   /**
    * @brief Extends the outer-most dimension of this tensor by num elements,
@@ -602,7 +602,7 @@ class Tensor {
     auto old_size = size_;
     dims_.resize(src.size());
     TIndex new_size = 1;
-    for (int i = 0; i < src.size(); ++i) {
+    for (unsigned int i = 0; i < src.size(); ++i) {
       new_size *= src[i];
       dims_[i] = src[i];
     }
@@ -668,6 +668,17 @@ class Tensor {
 typedef Tensor<CPUContext> TensorCPU;
 
 constexpr int k_limit_default_ = 1000;
+
+// Type call registry
+typedef TypeMeta (*TypeCall)(void*);
+TypeCall GetTypeCallFunction(CaffeTypeId id);
+void RegisterTypeCallFunction(CaffeTypeId id, TypeCall c);
+
+template <class Context>
+TypeMeta GetTensorType(void* c) {
+  Tensor<Context>* tc = static_cast<Tensor<Context>*>(c);
+  return tc->meta();
+}
 
 // Shape call registry
 typedef vector<TIndex> (*ShapeCall)(void*);

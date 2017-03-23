@@ -8,10 +8,8 @@ Readers and Writers must be implemented such that read and write operations
 are atomic and thread safe.
 
 Examples of possible Readers and Writers:
-    HiveReader, HiveWriter,
     QueueReader, QueueWriter,
     DatasetReader, DatasetWriter,
-    DBReader, DBWriter,
 
 See `dataset.py` for an example of implementation.
 """
@@ -32,7 +30,7 @@ class Reader(object):
 
     def schema(self):
         """
-        Return the schema associated with the Hive Reader
+        Return the schema associated with the Reader
         """
         assert self._schema is not None, 'Schema not provided for this reader.'
         return self._schema
@@ -237,7 +235,7 @@ class PipedReaderBuilder(ReaderBuilder):
     E.g.:
 
     PipedReaderBuilder(
-        HiveReaderBuilder(...),
+        ReaderBuilder(...),
         lambda reader: pipe(reader, processor=my_proc))
     """
 
@@ -317,7 +315,12 @@ class CounterReader(Reader):
 
 
 class ReaderWithLimit(Reader):
-    """ Reader that stops after `num_iter` calls. """
+    """
+    Reader that stops after `num_iter` calls.
+
+    If num_iter is None it becomes just a simple reader that exports a global
+    flag for "out of data".
+    """
     def __init__(self, reader, num_iter=1):
         Reader.__init__(self, schema=reader._schema)
         self.reader = reader
@@ -326,20 +329,28 @@ class ReaderWithLimit(Reader):
         net = core.Net('reader_with_limit')
         self._data_finished = net.AddExternalInput(
             net.NextName('data_finished'))
-        self.counter = net.AddExternalInput(net.NextName('counter'))
+        if self.num_iter is not None:
+            self.counter = net.AddExternalInput(net.NextName('counter'))
 
     def setup_ex(self, global_init_net, global_finish_net):
-        global_init_net.CreateCounter(
-            [], [self.counter], init_count=int(self.num_iter))
+        if self.counter:
+            global_init_net.CreateCounter(
+                [], [self.counter], init_count=int(self.num_iter))
         self.reader.setup_ex(global_init_net, global_finish_net)
         global_init_net.ConstantFill(
             [], [self._data_finished],
             shape=[], value=False, dtype=core.DataType.BOOL)
 
     def read_ex(self, local_init_net, local_finish_net):
-        """ 1. check if we reached number of iterations """
+        """ 1. check if we reached number of iterations and populate the same
+        should_stop blob """
         count_net = core.Net('limited_reader_counter')
-        should_stop = count_net.CountDown([self.counter], 1)
+        if self.counter:
+            should_stop = count_net.CountDown([self.counter], 1)
+        else:
+            should_stop = count_net.ConstantFill(
+                [], 1,
+                shape=[], value=False, dtype=core.DataType.BOOL)
 
         """ 2. call original reader """
         nets, local_data_finished, fields = self.reader.read_ex(
@@ -348,8 +359,12 @@ class ReaderWithLimit(Reader):
 
         """ 3. check if original reader is done. """
         check_done_net = core.Net('limited_reader_post')
+        # copy to the same blob as the counter output to trigger reader
+        # stopping
         check_done_net.Copy(local_data_finished, should_stop)
-        check_done_net.Copy([local_data_finished], [self._data_finished])
+        # update global flag that underlying reader is done
+        check_done_net.Or([self._data_finished, local_data_finished],
+                          [self._data_finished])
 
         # this relies on `should_stop` being called after each net.
         return [count_net] + nets + [check_done_net], should_stop, fields

@@ -12,6 +12,11 @@ REGISTER_CPU_OPERATOR(Alias, AliasOp<CPUContext>);
 REGISTER_CPU_OPERATOR(ResizeLike, ResizeLikeOp<CPUContext>);
 REGISTER_CPU_OPERATOR(Sum, SumOp<float, CPUContext>);
 REGISTER_CPU_OPERATOR(SumInt, SumOp<int, CPUContext>);
+REGISTER_CPU_OPERATOR(SumElements, SumElementsOp<float, CPUContext>);
+REGISTER_CPU_OPERATOR(
+    SumElementsGradient,
+    SumElementsGradientOp<float, CPUContext>);
+
 REGISTER_CPU_OPERATOR(WeightedSum, WeightedSumOp<float, CPUContext>);
 REGISTER_CPU_OPERATOR(
     ScatterWeightedSum,
@@ -27,9 +32,11 @@ REGISTER_CPU_OPERATOR(
 REGISTER_CPU_OPERATOR(
     CopyFromCPUInput,
     CopyOp<CPUContext, CPUContext, CPUContext>);
+REGISTER_CPU_OPERATOR(
+    CopyOnDeviceLike,
+    CopyOnDeviceLikeOp<CPUContext, CPUContext, CPUContext>);
 REGISTER_CPU_OPERATOR(Copy, CopyOp<CPUContext, CPUContext, CPUContext>);
 REGISTER_CPU_OPERATOR(Shape, ShapeOp<CPUContext>);
-REGISTER_CPU_OPERATOR(Reshape, ReshapeOp<float, CPUContext>);
 REGISTER_CPU_OPERATOR(LengthsToShape, LengthsToShapeOp<CPUContext>);
 REGISTER_CPU_OPERATOR(HasElements, HasElementsOp<CPUContext>);
 REGISTER_CPU_OPERATOR(IsEmpty, IsEmptyOp<CPUContext>);
@@ -44,6 +51,10 @@ REGISTER_CPU_OPERATOR(Slice, SliceOp<int, CPUContext>);
 REGISTER_CPU_OPERATOR(Squeeze, SqueezeOp<CPUContext>);
 REGISTER_CPU_OPERATOR(ExpandDims, ExpandDimsOp<CPUContext>);
 REGISTER_CPU_OPERATOR(LengthsToWeights, LengthsToWeightsOp<CPUContext>);
+REGISTER_CPU_OPERATOR(EnsureDense, EnsureDenseOp<CPUContext>);
+REGISTER_CPU_OPERATOR(
+    AccumulateHistogram,
+    AccumulateHistogramOp<float, CPUContext>);
 
 OPERATOR_SCHEMA(WallClockTime)
     .NumInputs(0)
@@ -66,48 +77,47 @@ OPERATOR_SCHEMA(Print)
 
 OPERATOR_SCHEMA(LengthsToShape).NumInputs(1).NumOutputs(1);
 
-OPERATOR_SCHEMA(Reshape)
-    .NumInputs(1, 2)
-    .NumOutputs(2)
-    .AllowInplace({{0, 0}})
-    .SetDoc(R"DOC(
-Reshape the input tensor similar to numpy.reshape.
+OPERATOR_SCHEMA(SumElements)
+    .NumInputs(1)
+    .NumOutputs(1)
+    .ScalarType(TensorProto::FLOAT)
+    .SetDoc("Sums the elements of the input tensor.")
+    .Arg("average", "whether to average or not")
+    .Input(0, "X", "Tensor to sum up")
+    .Output(0, "sum", "Scalar sum");
 
-It takes a tensor as input and an optional tensor specifying the new shape.
-When the second input is absent, an extra argument `shape` must be specified.
-It outputs the reshaped tensor as well as the original shape.
-
-At most one dimension of the new shape can be -1. In this case, the value is
-inferred from the size of the tensor and the remaining dimensions. A dimension
-could also be 0, in which case the actual dimension value is going to be copied
-from the input tensor.
-)DOC")
-    .Arg("shape", "New shape")
-    .Input(0, "data", "An input tensor.")
-    .Input(1, "new_shape", "New shape.")
-    .Output(0, "reshaped", "Reshaped data.")
-    .Output(1, "old_shape", "Original shape.");
-
-class GetReshapeGradient : public GradientMakerBase {
+class GetSumElementsGradient : public GradientMakerBase {
   using GradientMakerBase::GradientMakerBase;
   vector<OperatorDef> GetGradientDefs() override {
     return SingleGradientDef(
-        "Reshape", "",
-        vector<string>{GO(0), O(1)},
-        vector<string>{GI(0), "_" + GI(0) + "_dims"});
-  }
-
-  // Argument `shape` is no longer needed in backprop.
-  bool CopyArguments() const override {
-    return false;
+        "SumElementsGradient",
+        "",
+        vector<string>{I(0), GO(0)},
+        vector<string>{GI(0)});
   }
 };
-
-REGISTER_GRADIENT(Reshape, GetReshapeGradient);
+REGISTER_GRADIENT(SumElements, GetSumElementsGradient);
 
 OPERATOR_SCHEMA(Flatten)
     .NumInputs(1)
     .NumOutputs(1)
+    .TensorInferenceFunction(
+        [](const OperatorDef&, const vector<TensorShape>& in) {
+          vector<TensorShape> out(1);
+          int total = 1;
+          std::size_t index = 0;
+          for (auto d : in[0].dims()) {
+            // skip the first element
+            if (index++ == 0) {
+              continue;
+            }
+            total *= d;
+          }
+          out[0].set_data_type(in[0].data_type());
+          out[0].add_dims(in[0].dims(0));
+          out[0].add_dims(total);
+          return out;
+        })
     .SetDoc(R"DOC(
 Flattens the input tensor into a 2D matrix, keeping the first dimension
 unchanged.
@@ -124,16 +134,16 @@ OPERATOR_SCHEMA(FlattenToVec)
     .NumInputs(1)
     .NumOutputs(1)
     .TensorInferenceFunction(
-          [](const OperatorDef& def, const vector<TensorShape>& in) {
-            vector<TensorShape> out(1);
-            int total = 1;
-            for(auto d : in[0].dims()) {
-              total *= d;
-            }
-            out[0].add_dims(total);
-            return out;
+        [](const OperatorDef& def, const vector<TensorShape>& in) {
+          vector<TensorShape> out(1);
+          int total = 1;
+          for (auto d : in[0].dims()) {
+            total *= d;
           }
-    )
+          out[0].set_data_type(in[0].data_type());
+          out[0].add_dims(total);
+          return out;
+        })
     .SetDoc(R"DOC(
 Flattens the input tensor into a 1D vector.
 )DOC")
@@ -167,29 +177,29 @@ OPERATOR_SCHEMA(ResizeLike)
     .NumInputs(2)
     .NumOutputs(1)
     .TensorInferenceFunction(
-          [](const OperatorDef& def, const vector<TensorShape>& in) {
-            vector<TensorShape> out(1);
-            out.push_back(in[1]);
-            out[0].set_data_type(in[0].data_type());
-            return out;
-          })
+        [](const OperatorDef& def, const vector<TensorShape>& in) {
+          vector<TensorShape> out(1);
+          out.push_back(in[1]);
+          out[0].set_data_type(in[0].data_type());
+          return out;
+        })
     .SetDoc(R"DOC(
-Produces tensor condaining data of first input and shape of second input.
+Produces tensor containing data of first input and shape of second input.
 )DOC")
     .Input(0, "data", "Tensor whose data will be copied into the output.")
     .Input(1, "shape_tensor", "Tensor whose shape will be applied to output.")
     .Output(0, "output", "Tensor with data of input 0 and shape of input 1.");
 
-
 OPERATOR_SCHEMA(SumInt)
     .NumInputs(1, INT_MAX)
     .NumOutputs(1)
-    .TensorInferenceFunction([](const OperatorDef& def, const vector<TensorShape>& in) {
-      vector<TensorShape> out(1);
-      out.push_back(in[0]);
-      out[0].set_data_type(TensorProto::INT32);
-      return out;
-    })
+    .TensorInferenceFunction(
+        [](const OperatorDef& def, const vector<TensorShape>& in) {
+          vector<TensorShape> out(1);
+          out.push_back(in[0]);
+          out[0].set_data_type(TensorProto::INT32);
+          return out;
+        })
     .AllowInplace({{0, 0}});
 
 OPERATOR_SCHEMA(Sum)
@@ -269,7 +279,7 @@ Currently only works on CPU because of access to INDICES.
 OPERATOR_SCHEMA(Max)
     .NumInputs(1, INT_MAX)
     .NumOutputs(1)
-    .IdenticalTypeAndShape()
+    .IdenticalTypeAndShapeOfInput(0)
     .AllowInplace({{0, 0}})
     .SetDoc(R"DOC(
 Element-wise max of each of the input tensors. The first input tensor can be
@@ -362,15 +372,24 @@ Context (GPU or CPU). This may involves cross-device MemCpy.
     .Input(0, "input", "The input CPU tensor.")
     .Output(0, "output", "either a TensorCUDA or a TensorCPU");
 
+OPERATOR_SCHEMA(CopyOnDeviceLike)
+    .NumInputs(2)
+    .NumOutputs(1)
+    .SetDoc("Copy input tensor into output to the specific device.")
+    .Input(0, "input", "The input tensor.")
+    .Input(1, "dst", "Tensor, on which device the copy will be performed.")
+    .Output(0, "output", "Tensor that will contain a copy of the input.");
+
 OPERATOR_SCHEMA(Shape)
     .NumInputs(1)
     .NumOutputs(1)
-    .TensorInferenceFunction([](const OperatorDef& def, const vector<TensorShape>& in) {
-      vector<TensorShape> out(1);
-      out[0].add_dims(in[0].dims().size());
-      out[0].set_data_type(TensorProto::INT32);
-      return out;
-    })
+    .TensorInferenceFunction(
+        [](const OperatorDef& def, const vector<TensorShape>& in) {
+          vector<TensorShape> out(1);
+          out[0].add_dims(in[0].dims().size());
+          out[0].set_data_type(TensorProto::INT32);
+          return out;
+        })
     .SetDoc("Produce a 1D int64 tensor with the shape of the input tensor.");
 
 OPERATOR_SCHEMA(HasElements)
@@ -494,13 +513,11 @@ OPERATOR_SCHEMA(LengthsToRanges)
     .SetDoc(R"DOC(
 Given a vector of segment lengths, calculates offsets of each segment and packs
 them next to the lengths. For the input vector of length N the output is a Nx2
-matrix with (offset, lengths) packaged for each segment. Output is going to have
-the same type as input. For long tensors explicit casting from int32 to int64
-might be necessary prior to this op.
+matrix with (offset, lengths) packaged for each segment.
 
 For example, `[1, 3, 0, 2]` transforms into `[[0, 1], [1, 3], [4, 0], [4, 2]]`.
 )DOC")
-    .Input(0, "lengths", "1D tensor of int32 or int64 segment lengths.")
+    .Input(0, "lengths", "1D tensor of int32 segment lengths.")
     .Output(
         0,
         "ranges",
@@ -548,8 +565,8 @@ OPERATOR_SCHEMA(LengthsToWeights)
     .NumInputs(1)
     .NumOutputs(1)
     .Arg("power", "n of 1/pow(length,n) for normalization")
-    .SetDoc(
-        R"DOC( Similar as LengthsToSegmentIds but output vector of segment
+    .SetDoc(R"DOC(
+Similar as LengthsToSegmentIds but output vector of segment
 weights derived by lengths. i.e 1/pow(length, power)
 )DOC")
     .Input(0, "lengths", "1-D int32_t or int64_t tensor of lengths")
@@ -643,6 +660,66 @@ caution.
 
 )DOC");
 
+OPERATOR_SCHEMA(EnsureDense)
+    .NumInputs(1)
+    .NumOutputs(1)
+    .AllowInplace({{0, 0}})
+    .SetDoc(R"DOC(
+This operator converts dense or sparse gradients to dense ones.
+Therefore, sparse gradient can be back propagated to Operators that consume
+dense gradients only (e.g., FCGradient).
+
+The operator's behaviors:
+- In forward, simply pass in place or copy input to the output.
+- In backward, if the gradient passed-in is sparse gradient, change it to
+  dense gradient in linear time; otherwise, simply pass the dense gradient.
+)DOC")
+    .Input(0, "input", "Input tensors.")
+    .Output(0, "output", "Output tensor. Same dimension as inputs.");
+
+OPERATOR_SCHEMA(AccumulateHistogram)
+    .NumInputs(1)
+    .NumOutputs(2)
+    .SetDoc(R"DOC(
+This operator calculate thes histogram of values in input tensor.
+There're 2 outputs, one for histogram of current input tensor, and another
+for histogram of the all input tensors accumulated through history.
+The output would contain num_buckets + 2 values. index[1 ... num_buckets]
+for values in [lower_bound, upper_bound) interval. And the rest 2 for values
+smaller than lower_bound or greater than upper_bound respectively.
+)DOC")
+    .Input(0, "X", "Input tensor.")
+    .Output(0, "CurHist", "Output histogram of the current tensor.")
+    .Output(1, "AccHist", "Accumulated histogram of the history tensor.")
+    .Arg("lower_bound", "the lower bound value")
+    .Arg("upper_bound", "the upper bound value")
+    .Arg(
+        "num_buckets",
+        "number of buckets to use in [lower_bound, upper_bound)");
+
+class GetEnsureDenseGradient : public GradientMakerBase {
+  using GradientMakerBase::GradientMakerBase;
+  vector<OperatorDef> GetGradientDefs() override {
+    CAFFE_ENFORCE(
+        GradOut(0).IsSparse() || GradOut(0).IsDense(),
+        "Input gradient ",
+        O(0),
+        " should be either sparse or dense.");
+
+    if (GradOut(0).IsDense()) {
+      SetDense(0, GO(0));
+      return vector<OperatorDef>();
+    } else {
+      return SingleGradientDef(
+          "SparseToDense",
+          "",
+          vector<string>{GO_I(0), GO_V(0), I(0)},
+          vector<string>{GI(0)});
+    }
+  }
+};
+REGISTER_GRADIENT(EnsureDense, GetEnsureDenseGradient);
+
 SHOULD_NOT_DO_GRADIENT(Print);
 SHOULD_NOT_DO_GRADIENT(Shape);
 SHOULD_NOT_DO_GRADIENT(HasElements);
@@ -721,11 +798,6 @@ class GetMaxGradient : public GradientMakerBase {
 };
 REGISTER_GRADIENT(Max, GetMaxGradient);
 
-// TODO(jiayq): Copy is a bit tricky because one need to figure out correctly
-// where the input lies (e.g. for muji, which gpu). Right now I am marking it
-// as not gradient ready.
-SHOULD_NOT_DO_GRADIENT(Copy);
-
 class GetGatherGradient : public GradientMakerBase {
   using GradientMakerBase::GradientMakerBase;
   vector<OperatorDef> GetGradientDefs() override {
@@ -763,6 +835,18 @@ struct GetFlattenToVecGradient : public GradientMakerBase {
 };
 REGISTER_GRADIENT(FlattenToVec, GetFlattenToVecGradient);
 
+struct GetCopyGradient : public GradientMakerBase {
+  using GradientMakerBase::GradientMakerBase;
+  vector<OperatorDef> GetGradientDefs() override {
+    return SingleGradientDef(
+        "CopyOnDeviceLike",
+        "",
+        vector<string>{GO(0), I(0)},
+        vector<string>{GI(0)});
+  }
+};
+REGISTER_GRADIENT(Copy, GetCopyGradient);
+
 struct GetGPUToCPUGradient : public GradientMakerBase {
   using GradientMakerBase::GradientMakerBase;
   vector<OperatorDef> GetGradientDefs() override {
@@ -789,7 +873,50 @@ SHOULD_NOT_DO_GRADIENT(SegmentIdsToLengthWeights);
 // TODO(azzolini): Add support for slice gradient
 SHOULD_NOT_DO_GRADIENT(Slice);
 SHOULD_NOT_DO_GRADIENT(GatherRangesOp);
+SHOULD_NOT_DO_GRADIENT(AccumulateHistogram);
 
 } // namespace
+
+template <typename T, class Context>
+bool MaxOp<T, Context>::Compute() {
+  auto& input0 = Input(0);
+  const int N = input0.size();
+  T* output_data = Output(0)->template mutable_data<T>();
+
+  for (int i = 1; i < InputSize(); i++) {
+    auto input_data = Input(i).template data<T>();
+    EigenVectorMap<T> output_vec(output_data, N);
+    output_vec = output_vec.cwiseMax(ConstEigenVectorMap<T>(input_data, N));
+  }
+
+  return true;
+}
+
+template <typename T, class Context>
+bool MaxGradientOp<T, Context>::RunOnDevice() {
+  auto& output = Input(0);
+  auto& grad_output = Input(1);
+  const int kInputStartOffset = 2;
+
+  const T* data = output.template data<T>();
+  ConstEigenArrayMap<T> output_array(
+      output.template data<T>(), 1, output.size());
+  ConstEigenArrayMap<T> grad_out_array(
+      grad_output.template data<T>(), 1, grad_output.size());
+
+  for (int i = 0; i < OutputSize(); i++) {
+    auto& input = Input(i + kInputStartOffset);
+    ConstEigenArrayMap<T> input_array(
+        input.template data<T>(), 1, input.size());
+
+    auto* grad_input = Output(i);
+    grad_input->ResizeLike(input);
+    EigenArrayMap<T> grad_in_array(
+        grad_input->template mutable_data<T>(), 1, grad_input->size());
+    grad_in_array = grad_out_array *
+        input_array.cwiseEqual(output_array).template cast<T>();
+  }
+  return true;
+}
 
 } // namespace caffe2
